@@ -1,0 +1,20 @@
+function testerYouTube() {
+
+  const chaine = YouTube.Channels.list('snippet,contentDetails', {
+    mine: true
+  });
+
+  if (!chaine.items || chaine.items.length === 0) {
+    throw new Error("Aucune chaîne YouTube trouvée sur ce compte Google.");
+  }
+
+  const channel = chaine.items[0];
+
+  Logger.log("Chaîne : " + channel.snippet.title);
+  Logger.log("ID de la chaîne : " + channel.id);
+
+  Logger.log(
+    "Playlist des vidéos : " +
+    channel.contentDetails.relatedPlaylists.uploads
+  );
+}
