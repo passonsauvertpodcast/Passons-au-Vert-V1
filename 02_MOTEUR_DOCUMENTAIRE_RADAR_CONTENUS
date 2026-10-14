@@ -1,0 +1,3305 @@
+// ============================================================================
+// PASSONS AU VERT — MOTEUR DOCUMENTAIRE COMPACT V4
+// + TRANSFERT RADAR → CONTENUS
+// VERSION FINALE
+// ============================================================================
+
+// ============================================================================
+// 1 — CONFIGURATION
+// ============================================================================
+
+const CONFIG = {
+  NOTION_VERSION: '2026-03-11',
+
+  RADAR_DATA_SOURCE_ID: '61543e5e-0913-470b-be2f-3eee182320a4',
+  DOSSIERS_DATA_SOURCE_ID: '3f808daf-28d7-46a1-89b1-ca78a1d812e3',
+  CONTENUS_DATA_SOURCE_ID: 'fa9ee98c-8cad-4ffe-8ca3-73df5ad10ba1',
+
+  IUCN_API_BASE: 'https://api.iucnredlist.org/api/v4',
+  IUCN_VERSION: '2026-1',
+
+  PURGE_AFTER_DAYS: 61,
+  TRIGGER_MINUTE: 5,
+
+  MAX_SOURCES: 50,
+  MAX_BLOCKS_PER_APPEND: 100
+};
+
+
+// ============================================================================
+// 2 — TOKEN NOTION
+// ============================================================================
+
+function getNotionToken_() {
+  const token = PropertiesService
+    .getScriptProperties()
+    .getProperty('NOTION_TOKEN');
+
+  if (!token) {
+    throw new Error(
+      'NOTION_TOKEN introuvable dans les propriétés du script.'
+    );
+  }
+
+  return token;
+}
+
+
+// ============================================================================
+// 3 — API NOTION
+// ============================================================================
+
+function notionRequest_(method, path, payload) {
+  const token = getNotionToken_();
+
+  const options = {
+    method: method,
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Notion-Version': CONFIG.NOTION_VERSION,
+      'Content-Type': 'application/json'
+    },
+    muteHttpExceptions: true
+  };
+
+  if (payload !== undefined && payload !== null) {
+    options.payload = JSON.stringify(payload);
+  }
+
+  const url = 'https://api.notion.com/v1' + path;
+
+  const response = UrlFetchApp.fetch(url, options);
+  const code = response.getResponseCode();
+  const text = response.getContentText();
+
+  let json;
+
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    json = {
+      raw: text
+    };
+  }
+
+  if (code < 200 || code >= 300) {
+    throw new Error(
+      'Notion API ' +
+      method +
+      ' ' +
+      path +
+      ' → HTTP ' +
+      code +
+      ' : ' +
+      text
+    );
+  }
+
+  return json;
+}
+
+
+// ============================================================================
+// 4 — DATA SOURCE
+// ============================================================================
+
+function getDataSource_(dataSourceId) {
+  return notionRequest_(
+    'get',
+    '/data_sources/' + dataSourceId
+  );
+}
+
+
+// ============================================================================
+// 5 — REQUÊTE COMPLÈTE D’UN DATA SOURCE
+// ============================================================================
+
+function queryDataSourceAll_(dataSourceId) {
+  const results = [];
+  let cursor = null;
+
+  while (true) {
+    const payload = {
+      page_size: 100
+    };
+
+    if (cursor) {
+      payload.start_cursor = cursor;
+    }
+
+    const response = notionRequest_(
+      'post',
+      '/data_sources/' + dataSourceId + '/query',
+      payload
+    );
+
+    if (response.results) {
+      results.push.apply(results, response.results);
+    }
+
+    if (!response.has_more || !response.next_cursor) {
+      break;
+    }
+
+    cursor = response.next_cursor;
+  }
+
+  return results;
+}
+
+
+// ============================================================================
+// 6 — OUTILS GÉNÉRAUX
+// ============================================================================
+
+function normalize_(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+
+function clean_(value) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+
+function today_() {
+  return Utilities.formatDate(
+    new Date(),
+    Session.getScriptTimeZone() || 'Europe/Paris',
+    'yyyy-MM-dd'
+  );
+}
+
+
+function truncate_(value, max) {
+  const text = String(value || '');
+
+  if (text.length <= max) {
+    return text;
+  }
+
+  return text.substring(0, max - 1) + '…';
+}
+
+
+// ============================================================================
+// 7 — PROPRIÉTÉS NOTION
+// ============================================================================
+
+function findProperty_(page, names) {
+  if (!page || !page.properties) {
+    return null;
+  }
+
+  const wanted = Array.isArray(names) ? names : [names];
+
+  for (const name of wanted) {
+    if (page.properties[name]) {
+      return page.properties[name];
+    }
+  }
+
+  const normalizedNames = wanted.map(normalize_);
+
+  for (const key in page.properties) {
+    if (
+      normalizedNames.indexOf(
+        normalize_(key)
+      ) !== -1
+    ) {
+      return page.properties[key];
+    }
+  }
+
+  return null;
+}
+
+
+function findPropertyName_(page, names) {
+  if (!page || !page.properties) {
+    return null;
+  }
+
+  const wanted = Array.isArray(names) ? names : [names];
+
+  for (const name of wanted) {
+    if (page.properties[name]) {
+      return name;
+    }
+  }
+
+  const normalizedNames = wanted.map(normalize_);
+
+  for (const key in page.properties) {
+    if (
+      normalizedNames.indexOf(
+        normalize_(key)
+      ) !== -1
+    ) {
+      return key;
+    }
+  }
+
+  return null;
+}
+
+
+function propText_(property) {
+  if (!property) {
+    return '';
+  }
+
+  if (property.type === 'title') {
+    return (property.title || [])
+      .map(x => x.plain_text || '')
+      .join('');
+  }
+
+  if (property.type === 'rich_text') {
+    return (property.rich_text || [])
+      .map(x => x.plain_text || '')
+      .join('');
+  }
+
+  if (property.type === 'select') {
+    return property.select ? property.select.name || '' : '';
+  }
+
+  if (property.type === 'status') {
+    return property.status ? property.status.name || '' : '';
+  }
+
+  if (property.type === 'multi_select') {
+    return (property.multi_select || [])
+      .map(x => x.name || '')
+      .join(', ');
+  }
+
+  if (property.type === 'url') {
+    return property.url || '';
+  }
+
+  if (property.type === 'number') {
+    return property.number === null ||
+      property.number === undefined
+      ? ''
+      : String(property.number);
+  }
+
+  if (property.type === 'date') {
+    if (!property.date) {
+      return '';
+    }
+
+    return property.date.start || '';
+  }
+
+  if (property.type === 'checkbox') {
+    return property.checkbox ? 'true' : 'false';
+  }
+
+  if (property.type === 'formula') {
+    if (!property.formula) {
+      return '';
+    }
+
+    if (property.formula.type === 'string') {
+      return property.formula.string || '';
+    }
+
+    if (property.formula.type === 'number') {
+      return property.formula.number === null
+        ? ''
+        : String(property.formula.number);
+    }
+
+    if (property.formula.type === 'boolean') {
+      return property.formula.boolean ? 'true' : 'false';
+    }
+
+    if (property.formula.type === 'date') {
+      return property.formula.date
+        ? property.formula.date.start || ''
+        : '';
+    }
+  }
+
+  if (property.type === 'people') {
+    return (property.people || [])
+      .map(x => x.name || x.id || '')
+      .join(', ');
+  }
+
+  if (property.type === 'relation') {
+    return (property.relation || [])
+      .map(x => x.id || '')
+      .join(', ');
+  }
+
+  return '';
+}
+
+
+function richTextValueForNotion_(text) {
+  return {
+    rich_text: [
+      {
+        type: 'text',
+        text: {
+          content: truncate_(String(text || ''), 2000)
+        }
+      }
+    ]
+  };
+}
+
+
+function urlValue_(url) {
+  const value = clean_(url);
+
+  if (!value) {
+    return {
+      url: null
+    };
+  }
+
+  return {
+    url: value
+  };
+}
+
+
+function titleValue_(text) {
+  return {
+    title: [
+      {
+        type: 'text',
+        text: {
+          content: truncate_(String(text || ''), 2000)
+        }
+      }
+    ]
+  };
+}
+
+
+function heading2_(text) {
+  return {
+    object: 'block',
+    type: 'heading_2',
+    heading_2: {
+      rich_text: [
+        {
+          type: 'text',
+          text: {
+            content: truncate_(String(text || ''), 2000)
+          }
+        }
+      ]
+    }
+  };
+}
+
+
+function paragraph_(text) {
+  return {
+    object: 'block',
+    type: 'paragraph',
+    paragraph: {
+      rich_text: [
+        {
+          type: 'text',
+          text: {
+            content: truncate_(String(text || ''), 2000)
+          }
+        }
+      ]
+    }
+  };
+}
+
+
+// ============================================================================
+// 8 — BLOCS NOTION
+// ============================================================================
+
+function getPageBlocks_(pageId) {
+  const response = notionRequest_(
+    'get',
+    '/blocks/' + pageId + '/children?page_size=100'
+  );
+
+  return response.results || [];
+}
+
+
+function appendBlocks_(pageId, blocks) {
+  if (!blocks || !blocks.length) {
+    return;
+  }
+
+  for (
+    let i = 0;
+    i < blocks.length;
+    i += CONFIG.MAX_BLOCKS_PER_APPEND
+  ) {
+    const chunk = blocks.slice(
+      i,
+      i + CONFIG.MAX_BLOCKS_PER_APPEND
+    );
+
+    notionRequest_(
+      'patch',
+      '/blocks/' + pageId + '/children',
+      {
+        children: chunk
+      }
+    );
+  }
+}
+
+
+// ============================================================================
+// 9 — CRÉATION DE PAGE
+// ============================================================================
+
+function createPage_(dataSourceId, properties) {
+  return notionRequest_(
+    'post',
+    '/pages',
+    {
+      parent: {
+        type: 'data_source_id',
+        data_source_id: dataSourceId
+      },
+      properties: properties
+    }
+  );
+}
+
+
+// ============================================================================
+// 10 — ARCHIVAGE D’UNE PAGE NOTION
+// IMPORTANT : Notion utilise maintenant PATCH avec in_trash:true.
+// ============================================================================
+
+function archiverPage_(pageId) {
+  if (!pageId) {
+    throw new Error(
+      'Impossible d’archiver une page sans ID.'
+    );
+  }
+
+  return notionRequest_(
+    'patch',
+    '/pages/' + pageId,
+    {
+      in_trash: true
+    }
+  );
+}
+
+
+// ============================================================================
+// 11 — RADAR
+// ============================================================================
+
+function getRadarPages_() {
+  return queryDataSourceAll_(
+    CONFIG.RADAR_DATA_SOURCE_ID
+  );
+}
+
+
+// ============================================================================
+// 12 — LECTURE RADAR
+// ============================================================================
+
+function readRadar_(page) {
+  return {
+    id: page.id,
+
+    nom: propText_(
+      findProperty_(page, ['Nom'])
+    ),
+
+    taxon: propText_(
+      findProperty_(page, ['Taxon'])
+    ),
+
+    sujet: propText_(
+      findProperty_(page, ['Sujet'])
+    ),
+
+    resume: propText_(
+      findProperty_(page, ['Résumé'])
+    ),
+
+    notes: propText_(
+      findProperty_(page, ['Notes'])
+    ),
+
+    localisation: propText_(
+      findProperty_(page, ['Localisation'])
+    ),
+
+    domaine: propText_(
+      findProperty_(page, ['Domaine'])
+    ),
+
+    sourcePrimaire: propText_(
+      findProperty_(page, ['Source primaire'])
+    ),
+
+    doi: propText_(
+      findProperty_(page, ['DOI'])
+    ),
+
+    dateDetection: propText_(
+      findProperty_(page, ['Date de détection'])
+    ),
+
+    sujetRetenu:
+      findProperty_(page, ['Sujet retenu'])?.checkbox === true,
+
+    recherche:
+      findProperty_(page, ['Recherche documentaire'])?.checkbox === true,
+
+    statutRadar: propText_(
+      findProperty_(page, ['Statut radar'])
+    ),
+
+    createdTime: page.created_time || ''
+  };
+}
+
+
+// ============================================================================
+// 13 — EXCLUSIONS D’AUTEURS
+// ============================================================================
+
+const AUTEURS_EXCLUS = [
+  'wikipedia',
+  'wikimedia',
+  'facebook',
+  'instagram',
+  'reddit',
+  'youtube',
+  'pinterest'
+];
+
+
+function auteurExclu_(text) {
+  const n = normalize_(text);
+
+  return AUTEURS_EXCLUS.some(
+    mot => n.indexOf(normalize_(mot)) !== -1
+  );
+}
+
+
+// ============================================================================
+// 14 — MOTS TAXONOMIQUES IMPOSSIBLES
+// ============================================================================
+
+const TAXON_IMPOSSIBLE = [
+  'new species',
+  'sp. nov',
+  'gen. nov',
+  'family',
+  'order',
+  'class',
+  'phylum',
+  'kingdom',
+  'species',
+  'genus'
+];
+
+
+function taxonImpossible_(value) {
+  const n = normalize_(value);
+
+  return TAXON_IMPOSSIBLE.some(
+    mot => n === normalize_(mot)
+  );
+}
+
+
+// ============================================================================
+// 15 — VALIDATION BINOMINALE
+// ============================================================================
+
+function binomeValide_(value) {
+  const text = clean_(value);
+
+  return /^[A-Z][a-z-]{2,30}\s+[a-z][a-z-]{2,40}$/.test(text);
+}
+
+
+// ============================================================================
+// 16 — EXTRACTION BINOMINALE STRICTE
+// ============================================================================
+
+function extraireBinome_(text) {
+  const source = String(text || '');
+
+  const regex =
+    /\b([A-Z][a-z-]{2,30})\s+([a-z][a-z-]{2,40})\b/g;
+
+  const candidats = [];
+  let match;
+
+  while ((match = regex.exec(source)) !== null) {
+    const binome =
+      match[1] + ' ' + match[2];
+
+    if (
+      binomeValide_(binome) &&
+      !taxonImpossible_(match[1]) &&
+      !taxonImpossible_(match[2])
+    ) {
+      candidats.push(binome);
+    }
+  }
+
+  return candidats;
+}
+
+
+// ============================================================================
+// 17 — EXTRACTION ESPÈCE
+// ============================================================================
+
+function extraireEspece_(text) {
+  const candidats = extraireBinome_(text);
+
+  if (!candidats.length) {
+    return null;
+  }
+
+  return candidats[0];
+}
+
+
+// ============================================================================
+// 18 — EXTRACTION GENRE
+// ============================================================================
+
+function extraireGenre_(text) {
+  const source = String(text || '');
+
+  const match = source.match(
+    /\b([A-Z][a-z-]{2,30})\b/
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  if (taxonImpossible_(match[1])) {
+    return null;
+  }
+
+  return match[1];
+}
+
+
+// ============================================================================
+// 19 — DÉTECTION NOUVELLE ESPÈCE
+// ============================================================================
+
+function detecterNouvelleEspece_(text) {
+  const n = normalize_(text);
+
+  const indicateurs = [
+    'new species',
+    'new species of',
+    'a new species',
+    'new species from',
+    'sp. nov',
+    'species nova',
+    'newly described',
+    'newly described species',
+    'description of a new species',
+    'description of two new species',
+    'description of three new species',
+    'nouvelle espece',
+    'nouvelle espèce',
+    'deux nouvelles especes',
+    'deux nouvelles espèces'
+  ];
+
+  return indicateurs.some(
+    mot => n.indexOf(normalize_(mot)) !== -1
+  );
+}
+
+
+// ============================================================================
+// 20 — CONSTRUCTION DES REQUÊTES
+// ============================================================================
+
+function construireRequetes_(radar) {
+  const requetes = [];
+
+  const sujet = clean_(radar.sujet);
+  const taxon = clean_(radar.taxon);
+  const nom = clean_(radar.nom);
+
+  if (sujet) {
+    requetes.push(sujet);
+  }
+
+  if (taxon && sujet) {
+    requetes.push(
+      taxon + ' ' + sujet
+    );
+  }
+
+  if (nom && nom !== sujet) {
+    requetes.push(nom);
+  }
+
+  if (taxon) {
+    requetes.push(taxon);
+  }
+
+  return [...new Set(
+    requetes.filter(Boolean)
+  )];
+}
+
+
+// ============================================================================
+// 21 — JSON PUBLIC
+// ============================================================================
+
+function publicJson_(url) {
+  const response = UrlFetchApp.fetch(
+    url,
+    {
+      muteHttpExceptions: true,
+      headers: {
+        'User-Agent':
+          'Passons-au-Vert-documentation/1.0'
+      }
+    }
+  );
+
+  const code = response.getResponseCode();
+
+  if (code < 200 || code >= 300) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(
+      response.getContentText()
+    );
+  } catch (e) {
+    return null;
+  }
+}
+
+
+// ============================================================================
+// 22 — CROSSREF
+// ============================================================================
+
+function rechercherCrossref_(query) {
+  const url =
+    'https://api.crossref.org/works?query.bibliographic=' +
+    encodeURIComponent(query) +
+    '&rows=10';
+
+  const json = publicJson_(url);
+
+  if (
+    !json ||
+    !json.message ||
+    !json.message.items
+  ) {
+    return [];
+  }
+
+  return json.message.items.map(item => ({
+    type: 'crossref',
+    title:
+      (item.title && item.title[0]) || '',
+    authors:
+      (item.author || [])
+        .map(a =>
+          [a.given, a.family]
+            .filter(Boolean)
+            .join(' ')
+        )
+        .join(', '),
+    journal:
+      (item['container-title'] &&
+        item['container-title'][0]) ||
+      '',
+    date:
+      item.published &&
+      item.published['date-parts']
+        ? item.published['date-parts'][0]
+            .join('-')
+        : '',
+    doi:
+      item.DOI || '',
+    url:
+      item.URL || ''
+  }));
+}
+
+
+// ============================================================================
+// 23 — WIKIMEDIA
+// ============================================================================
+
+function rechercherWikimedia_(query) {
+  const url =
+    'https://commons.wikimedia.org/w/api.php?' +
+    'action=query' +
+    '&format=json' +
+    '&generator=search' +
+    '&gsrsearch=' +
+    encodeURIComponent(query) +
+    '&gsrnamespace=6' +
+    '&gsrlimit=10' +
+    '&prop=imageinfo' +
+    '&iiprop=url';
+
+  const json = publicJson_(url);
+
+  if (
+    !json ||
+    !json.query ||
+    !json.query.pages
+  ) {
+    return [];
+  }
+
+  return Object.keys(
+    json.query.pages
+  ).map(id => {
+    const item =
+      json.query.pages[id];
+
+    return {
+      type: 'wikimedia',
+      title: item.title || '',
+      url:
+        item.imageinfo &&
+        item.imageinfo[0]
+          ? item.imageinfo[0].descriptionurl || ''
+          : ''
+    };
+  });
+}
+
+
+// ============================================================================
+// 24 — GBIF
+// ============================================================================
+
+function rechercherGBIF_(query) {
+  const url =
+    'https://api.gbif.org/v1/species/match?name=' +
+    encodeURIComponent(query);
+
+  const json = publicJson_(url);
+
+  if (!json) {
+    return [];
+  }
+
+  return [
+    {
+      type: 'gbif',
+      title:
+        json.scientificName ||
+        query,
+      key:
+        json.usageKey || '',
+      rank:
+        json.rank || '',
+      status:
+        json.status || '',
+      acceptedName:
+        json.species ||
+        json.scientificName ||
+        ''
+    }
+  ];
+}
+
+
+// ============================================================================
+// 25 — CLASSIFICATION DES SOURCES
+// ============================================================================
+
+function classifierSource_(source, radar) {
+  const title = normalize_(
+    source.title
+  );
+
+  const taxon = normalize_(
+    radar.taxon
+  );
+
+  const sujet = normalize_(
+    radar.sujet
+  );
+
+  const text =
+    title +
+    ' ' +
+    normalize_(source.authors) +
+    ' ' +
+    normalize_(source.journal);
+
+  if (
+    source.type === 'crossref' &&
+    radar.doi &&
+    normalize_(source.doi) ===
+      normalize_(radar.doi)
+  ) {
+    return {
+      niveau: 5,
+      label: 'ESSENTIEL'
+    };
+  }
+
+  if (
+    taxon &&
+    text.indexOf(taxon) !== -1
+  ) {
+    return {
+      niveau: 4,
+      label: 'DIRECT'
+    };
+  }
+
+  if (
+    source.type === 'gbif' &&
+    taxon &&
+    normalize_(
+      source.title
+    ).indexOf(taxon) !== -1
+  ) {
+    return {
+      niveau: 4,
+      label: 'DIRECT'
+    };
+  }
+
+  if (
+    source.type === 'wikimedia'
+  ) {
+    return {
+      niveau: 1,
+      label: 'PISTE'
+    };
+  }
+
+  return {
+    niveau: 0,
+    label: 'HORS SUJET'
+  };
+}
+
+
+// ============================================================================
+// 26 — DOSSIERS
+// ============================================================================
+
+function getDossierPages_() {
+  return queryDataSourceAll_(
+    CONFIG.DOSSIERS_DATA_SOURCE_ID
+  );
+}
+
+
+function trouverDossierParNom_(radar) {
+  const pages = getDossierPages_();
+
+  const cible = normalize_(
+    radar.nom ||
+    radar.sujet
+  );
+
+  for (const page of pages) {
+    const nom = normalize_(
+      propText_(
+        findProperty_(page, ['Nom'])
+      )
+    );
+
+    if (
+      nom &&
+      nom === cible
+    ) {
+      return page;
+    }
+  }
+
+  return null;
+}
+
+
+// ============================================================================
+// 27 — VÉRIFICATION DOSSIER DOCUMENTÉ
+// ============================================================================
+
+function dossierDocumente_(page) {
+  if (!page) {
+    return false;
+  }
+
+  const statut = normalize_(
+    propText_(
+      findProperty_(
+        page,
+        ['Statut documentaire']
+      )
+    )
+  );
+
+  if (
+    statut === 'dossier constitue' ||
+    statut === 'dossier documente'
+  ) {
+    return true;
+  }
+
+  const blocs =
+    getPageBlocks_(page.id);
+
+  const texte = normalize_(
+    blocs
+      .map(b => {
+        if (
+          b.type === 'paragraph'
+        ) {
+          return (
+            b.paragraph.rich_text || []
+          )
+            .map(x => x.plain_text || '')
+            .join(' ');
+        }
+
+        if (
+          b.type === 'heading_2'
+        ) {
+          return (
+            b.heading_2.rich_text || []
+          )
+            .map(x => x.plain_text || '')
+            .join(' ');
+        }
+
+        return '';
+      })
+      .join(' ')
+  );
+
+  return (
+    texte.indexOf(
+      'recherche documentaire'
+    ) !== -1 &&
+    texte.indexOf(
+      'sources'
+    ) !== -1
+  );
+}
+
+
+// ============================================================================
+// 28 — CRÉATION DOSSIER
+// ============================================================================
+
+function creerDossier_(radar) {
+  const properties = {};
+
+  const schema =
+    getDataSource_(
+      CONFIG.DOSSIERS_DATA_SOURCE_ID
+    );
+
+  const schemaProperties =
+    schema.properties || {};
+
+  const nomProp =
+    Object.keys(schemaProperties)
+      .find(
+        key =>
+          normalize_(key) ===
+          normalize_('Nom')
+      );
+
+  if (nomProp) {
+    properties[nomProp] =
+      titleValue_(
+        radar.nom ||
+        radar.sujet ||
+        'Dossier'
+      );
+  }
+
+  const sujetProp =
+    Object.keys(schemaProperties)
+      .find(
+        key =>
+          normalize_(key) ===
+          normalize_('Sujet')
+      );
+
+  if (sujetProp) {
+    properties[sujetProp] =
+      richTextValueForNotion_(
+        radar.sujet
+      );
+  }
+
+  const taxonProp =
+    Object.keys(schemaProperties)
+      .find(
+        key =>
+          normalize_(key) ===
+          normalize_('Taxon')
+      );
+
+  if (taxonProp) {
+    properties[taxonProp] =
+      richTextValueForNotion_(
+        radar.taxon
+      );
+  }
+
+  const statutProp =
+    Object.keys(schemaProperties)
+      .find(
+        key =>
+          normalize_(key) ===
+          normalize_('Statut documentaire')
+      );
+
+  if (
+    statutProp &&
+    schemaProperties[statutProp].type ===
+      'status'
+  ) {
+    properties[statutProp] = {
+      status: {
+        name: 'Dossier constitué'
+      }
+    };
+  }
+
+  const dateProp =
+    Object.keys(schemaProperties)
+      .find(
+        key =>
+          normalize_(key) ===
+          normalize_(
+            'Date dernière recherche'
+          )
+      );
+
+  if (dateProp) {
+    properties[dateProp] = {
+      date: {
+        start: today_()
+      }
+    };
+  }
+
+  return createPage_(
+    CONFIG.DOSSIERS_DATA_SOURCE_ID,
+    properties
+  );
+}
+
+
+// ============================================================================
+// 29 — DOI
+// ============================================================================
+
+function normaliserDOI_(doi) {
+  return String(doi || '')
+    .replace(/^https?:\/\/doi\.org\//i, '')
+    .replace(/^doi:\s*/i, '')
+    .trim();
+}
+
+
+// ============================================================================
+// 30 — FORMATAGE SOURCE
+// ============================================================================
+
+function formaterSource_(source, classification) {
+  const lignes = [];
+
+  lignes.push(
+    '[' +
+    classification.niveau +
+    ' — ' +
+    classification.label +
+    ']'
+  );
+
+  if (source.title) {
+    lignes.push(
+      source.title
+    );
+  }
+
+  if (source.authors) {
+    lignes.push(
+      'Auteurs : ' +
+      source.authors
+    );
+  }
+
+  if (source.journal) {
+    lignes.push(
+      'Publication : ' +
+      source.journal
+    );
+  }
+
+  if (source.date) {
+    lignes.push(
+      'Date : ' +
+      source.date
+    );
+  }
+
+  if (source.doi) {
+    lignes.push(
+      'DOI : ' +
+      source.doi
+    );
+  }
+
+  if (source.url) {
+    lignes.push(
+      'URL : ' +
+      source.url
+    );
+  }
+
+  return lignes.join('\n');
+}
+
+
+// ============================================================================
+// 31 — DÉDOUBLONNAGE
+// ============================================================================
+
+function dedoublonnerSources_(sources) {
+  const seen = {};
+  const result = [];
+
+  for (const source of sources) {
+    const key = normalize_(
+      [
+        source.type,
+        source.title,
+        source.doi,
+        source.url
+      ].join('|')
+    );
+
+    if (!seen[key]) {
+      seen[key] = true;
+      result.push(source);
+    }
+  }
+
+  return result;
+}
+
+
+// ============================================================================
+// 32 — DÉCOCHER RECHERCHE DOCUMENTAIRE
+// ============================================================================
+
+function uncheckRechercheDocumentaire_(page) {
+  const propertyName =
+    findPropertyName_(
+      page,
+      ['Recherche documentaire']
+    );
+
+  if (!propertyName) {
+    return;
+  }
+
+  const properties = {};
+
+  properties[propertyName] = {
+    checkbox: false
+  };
+
+  notionRequest_(
+    'patch',
+    '/pages/' + page.id,
+    {
+      properties: properties
+    }
+  );
+}
+
+
+// ============================================================================
+// 33 — TRAITEMENT D’UN SUJET
+// ============================================================================
+
+function traiterSujet_(page) {
+  const radar =
+    readRadar_(page);
+
+  Logger.log(
+    'TRAITEMENT : ' +
+    radar.nom
+  );
+
+  let dossier =
+    trouverDossierParNom_(radar);
+
+  if (!dossier) {
+    dossier =
+      creerDossier_(radar);
+  }
+
+  if (
+    dossierDocumente_(dossier)
+  ) {
+    Logger.log(
+      'Dossier déjà documenté : ' +
+      radar.nom
+    );
+
+    uncheckRechercheDocumentaire_(
+      page
+    );
+
+    return dossier;
+  }
+
+  const texteRecherche =
+    [
+      radar.nom,
+      radar.sujet,
+      radar.taxon,
+      radar.resume,
+      radar.notes
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+  const espece =
+    extraireEspece_(
+      texteRecherche
+    );
+
+  const genre =
+    extraireGenre_(
+      radar.taxon ||
+      texteRecherche
+    );
+
+  Logger.log(
+    'Espèce détectée : ' +
+    (espece || 'aucune')
+  );
+
+  Logger.log(
+    'Genre détecté : ' +
+    (genre || 'aucun')
+  );
+
+  const requetes =
+    construireRequetes_(
+      radar
+    );
+
+  let sources = [];
+
+  for (const requete of requetes) {
+    sources =
+      sources.concat(
+        rechercherCrossref_(
+          requete
+        )
+      );
+
+    sources =
+      sources.concat(
+        rechercherWikimedia_(
+          requete
+        )
+      );
+  }
+
+  if (radar.taxon) {
+    sources =
+      sources.concat(
+        rechercherGBIF_(
+          radar.taxon
+        )
+      );
+  }
+
+  sources =
+    dedoublonnerSources_(
+      sources
+    );
+
+  const sourcesClassees =
+    sources.map(
+      source => ({
+        source: source,
+        classification:
+          classifierSource_(
+            source,
+            radar
+          )
+      })
+    );
+
+  sourcesClassees.sort(
+    (a, b) =>
+      b.classification.niveau -
+      a.classification.niveau
+  );
+
+  const selection =
+    sourcesClassees.slice(
+      0,
+      CONFIG.MAX_SOURCES
+    );
+
+  const blocs = [];
+
+  blocs.push(
+    heading2_(
+      'Recherche documentaire automatique'
+    )
+  );
+
+  blocs.push(
+    paragraph_(
+      'Date de recherche : ' +
+      today_()
+    )
+  );
+
+  blocs.push(
+    paragraph_(
+      'Espèce détectée : ' +
+      (espece || 'non déterminée')
+    )
+  );
+
+  blocs.push(
+    paragraph_(
+      'Genre détecté : ' +
+      (genre || 'non déterminé')
+    )
+  );
+
+  blocs.push(
+    paragraph_(
+      'Nouvelle espèce : ' +
+      (
+        detecterNouvelleEspece_(
+          texteRecherche
+        )
+          ? 'oui'
+          : 'non déterminé'
+      )
+    )
+  );
+
+  blocs.push(
+    heading2_(
+      'Sources'
+    )
+  );
+
+  if (!selection.length) {
+    blocs.push(
+      paragraph_(
+        'Aucune source exploitable trouvée automatiquement.'
+      )
+    );
+  }
+
+  for (const item of selection) {
+    blocs.push(
+      paragraph_(
+        formaterSource_(
+          item.source,
+          item.classification
+        )
+      )
+    );
+  }
+
+  appendBlocks_(
+    dossier.id,
+    blocs
+  );
+
+  uncheckRechercheDocumentaire_(
+    page
+  );
+
+  Logger.log(
+    'Recherche documentaire terminée : ' +
+    radar.nom
+  );
+
+  return dossier;
+}
+
+
+// ============================================================================
+// 34 — MOTEUR PRINCIPAL
+// ============================================================================
+
+function lancerMoteurDocumentaire() {
+  Logger.log(
+    '========================================'
+  );
+
+  Logger.log(
+    'PASSONS AU VERT — MOTEUR DOCUMENTAIRE'
+  );
+
+  Logger.log(
+    '========================================'
+  );
+
+  const pages =
+    getRadarPages_();
+
+  let traites = 0;
+
+  for (const page of pages) {
+    const radar =
+      readRadar_(page);
+
+    if (!radar.recherche) {
+      continue;
+    }
+
+    try {
+      traiterSujet_(page);
+      traites++;
+    } catch (e) {
+      Logger.log(
+        'ERREUR : ' +
+        radar.nom +
+        ' → ' +
+        e.message
+      );
+    }
+  }
+
+  purgeRadar61Jours_();
+
+  Logger.log(
+    'Sujets traités : ' +
+    traites
+  );
+
+  Logger.log(
+    'FIN DU MOTEUR DOCUMENTAIRE'
+  );
+}
+
+
+// ============================================================================
+// 35 — PURGE À 61 JOURS
+// ============================================================================
+
+function purgeRadar61Jours_() {
+  const pages =
+    getRadarPages_();
+
+  const maintenant =
+    new Date();
+
+  const seuil =
+    CONFIG.PURGE_AFTER_DAYS *
+    24 *
+    60 *
+    60 *
+    1000;
+
+  for (const page of pages) {
+    const radar =
+      readRadar_(page);
+
+    if (radar.sujetRetenu) {
+      continue;
+    }
+
+    const dateEntree =
+      radar.dateDetection
+        ? new Date(
+            radar.dateDetection
+          )
+        : new Date(
+            radar.createdTime
+          );
+
+    if (
+      isNaN(
+        dateEntree.getTime()
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      maintenant.getTime() -
+      dateEntree.getTime() >=
+      seuil
+    ) {
+      Logger.log(
+        'ARCHIVAGE RADAR — 61 JOURS : ' +
+        radar.nom
+      );
+
+      archiverPage_(
+        page.id
+      );
+    }
+  }
+}
+
+
+// ============================================================================
+// 36 — TRIGGER HORAIRE
+// ============================================================================
+
+function installerTriggerMoteurDocumentaire() {
+  const triggers =
+    ScriptApp.getProjectTriggers();
+
+  for (const trigger of triggers) {
+    if (
+      trigger.getHandlerFunction() ===
+      'lancerMoteurDocumentaire'
+    ) {
+      ScriptApp.deleteTrigger(
+        trigger
+      );
+    }
+  }
+
+  ScriptApp.newTrigger(
+    'lancerMoteurDocumentaire'
+  )
+    .timeBased()
+    .everyHours(1)
+    .nearMinute(
+      CONFIG.TRIGGER_MINUTE
+    )
+    .create();
+
+  Logger.log(
+    'Trigger installé : toutes les heures vers xx:' +
+    String(
+      CONFIG.TRIGGER_MINUTE
+    ).padStart(2, '0')
+  );
+}
+
+
+// ============================================================================
+// 37 — TEST TAXONOMIQUE LECTURE SEULE
+// ============================================================================
+
+function testMoteurDocumentaire() {
+  const pages =
+    getRadarPages_();
+
+  Logger.log(
+    '========================================'
+  );
+
+  Logger.log(
+    'TEST MOTEUR DOCUMENTAIRE'
+  );
+
+  Logger.log(
+    'LECTURE SEULE — AUCUNE ÉCRITURE'
+  );
+
+  Logger.log(
+    '========================================'
+  );
+
+  for (const page of pages) {
+    const radar =
+      readRadar_(page);
+
+    if (!radar.recherche) {
+      continue;
+    }
+
+    const texte =
+      [
+        radar.nom,
+        radar.sujet,
+        radar.resume,
+        radar.taxon
+      ]
+        .filter(Boolean)
+        .join(' ');
+
+    Logger.log(
+      '----------------------------------------'
+    );
+
+    Logger.log(
+      'SUJET : ' +
+      radar.nom
+    );
+
+    Logger.log(
+      'Genre : ' +
+      (
+        extraireGenre_(
+          radar.taxon ||
+          texte
+        ) || 'aucun'
+      )
+    );
+
+    Logger.log(
+      'Espèce : ' +
+      (
+        extraireEspece_(
+          texte
+        ) || 'aucune'
+      )
+    );
+
+    Logger.log(
+      'Nouvelle espèce : ' +
+      (
+        detecterNouvelleEspece_(
+          texte
+        )
+          ? 'OUI'
+          : 'NON'
+      )
+    );
+  }
+
+  Logger.log(
+    'TEST TERMINÉ — AUCUNE ÉCRITURE'
+  );
+}
+
+
+// ============================================================================
+// 38 — TEST WIKIMEDIA
+// ============================================================================
+
+function testWikimedia_() {
+  const result =
+    rechercherWikimedia_(
+      'Anchiale'
+    );
+
+  Logger.log(
+    JSON.stringify(
+      result,
+      null,
+      2
+    )
+  );
+}
+
+
+// ============================================================================
+// 39 — IUCN
+// ============================================================================
+
+function rechercherIUCNEspece_(genre, espece) {
+  if (!genre || !espece) {
+    return null;
+  }
+
+  const url =
+    CONFIG.IUCN_API_BASE +
+    '/taxa/scientific_name?genus_name=' +
+    encodeURIComponent(genre) +
+    '&species_name=' +
+    encodeURIComponent(espece);
+
+  const response =
+    UrlFetchApp.fetch(
+      url,
+      {
+        muteHttpExceptions: true,
+        headers: {
+          'Authorization':
+            'Bearer ' +
+            getIUCNToken_()
+        }
+      }
+    );
+
+  const code =
+    response.getResponseCode();
+
+  if (code < 200 || code >= 300) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(
+      response.getContentText()
+    );
+  } catch (e) {
+    return null;
+  }
+}
+
+
+function getIUCNToken_() {
+  const token =
+    PropertiesService
+      .getScriptProperties()
+      .getProperty(
+        'IUCN_TOKEN'
+      );
+
+  if (!token) {
+    throw new Error(
+      'IUCN_TOKEN introuvable dans les propriétés du script.'
+    );
+  }
+
+  return token;
+}
+
+
+// ============================================================================
+// 40 — TRANSFERT RADAR → CONTENUS
+// ============================================================================
+
+const TRANSFERT_CONFIG = {
+  CONTENUS_DATA_SOURCE_ID:
+    CONFIG.CONTENUS_DATA_SOURCE_ID
+};
+
+
+// ============================================================================
+// 41 — LECTURE PROPRIÉTÉ TRANSFERT
+// ============================================================================
+
+function transfert35_prop_(page, names) {
+  return propText_(
+    findProperty_(
+      page,
+      names
+    )
+  );
+}
+
+
+function transfert35_bool_(page, names) {
+  const property =
+    findProperty_(
+      page,
+      names
+    );
+
+  return !!(
+    property &&
+    property.checkbox === true
+  );
+}
+
+
+// ============================================================================
+// 42 — LECTURE COMPLÈTE DU RADAR
+// ============================================================================
+
+function transfert35_readRadar_(page) {
+  return {
+    id: page.id,
+    url: page.url || '',
+    createdTime:
+      page.created_time || '',
+
+    nom:
+      transfert35_prop_(
+        page,
+        ['Nom']
+      ),
+
+    sujet:
+      transfert35_prop_(
+        page,
+        ['Sujet']
+      ),
+
+    taxon:
+      transfert35_prop_(
+        page,
+        ['Taxon']
+      ),
+
+    natureSujet:
+      transfert35_prop_(
+        page,
+        ['Nature du sujet']
+      ),
+
+    localisation:
+      transfert35_prop_(
+        page,
+        ['Localisation']
+      ),
+
+    resume:
+      transfert35_prop_(
+        page,
+        ['Résumé']
+      ),
+
+    auteurs:
+      transfert35_prop_(
+        page,
+        ['Auteurs']
+      ),
+
+    datePublication:
+      transfert35_prop_(
+        page,
+        ['Date de publication']
+      ),
+
+    doi:
+      transfert35_prop_(
+        page,
+        ['DOI']
+      ),
+
+    sourcePrimaire:
+      transfert35_prop_(
+        page,
+        ['Source primaire']
+      ),
+
+    notes:
+      transfert35_prop_(
+        page,
+        ['Notes']
+      ),
+
+    scoreEditorial:
+      transfert35_prop_(
+        page,
+        ['Score éditorial']
+      ),
+
+    potentielPVV:
+      transfert35_prop_(
+        page,
+        ['Potentiel PVV']
+      ),
+
+    typeDecouverte:
+      transfert35_prop_(
+        page,
+        ['Type de découverte']
+      ),
+
+    sourceDetection:
+      transfert35_prop_(
+        page,
+        ['Source de détection']
+      ),
+
+    domaine:
+      transfert35_prop_(
+        page,
+        ['Domaine']
+      ),
+
+    confiance:
+      transfert35_prop_(
+        page,
+        ['Confiance']
+      ),
+
+    format:
+      transfert35_prop_(
+        page,
+        ['Format']
+      ),
+
+    dateDetection:
+      transfert35_prop_(
+        page,
+        ['Date de détection']
+      ),
+
+    dejaDansContenus:
+      transfert35_bool_(
+        page,
+        ['Déjà dans les contenus']
+      ),
+
+    sujetRetenu:
+      transfert35_bool_(
+        page,
+        ['Sujet retenu']
+      ),
+
+    rechercheDocumentaire:
+      transfert35_bool_(
+        page,
+        ['Recherche documentaire']
+      ),
+
+    statutRadar:
+      transfert35_prop_(
+        page,
+        ['Statut radar']
+      )
+  };
+}
+
+
+// ============================================================================
+// 43 — LECTURE PAGINÉE DES BLOCS
+// ============================================================================
+
+function transfert35_blocks_(pageId) {
+  const results = [];
+  let cursor = null;
+
+  while (true) {
+    let path =
+      '/blocks/' +
+      pageId +
+      '/children?page_size=100';
+
+    if (cursor) {
+      path +=
+        '&start_cursor=' +
+        encodeURIComponent(
+          cursor
+        );
+    }
+
+    const response =
+      notionRequest_(
+        'get',
+        path
+      );
+
+    if (response.results) {
+      results.push.apply(
+        results,
+        response.results
+      );
+    }
+
+    if (
+      !response.has_more ||
+      !response.next_cursor
+    ) {
+      break;
+    }
+
+    cursor =
+      response.next_cursor;
+  }
+
+  return results;
+}
+
+
+// ============================================================================
+// 44 — EXTRACTION TEXTE DES BLOCS
+// ============================================================================
+
+function transfert35_blockText_(block) {
+  if (!block) {
+    return '';
+  }
+
+  const type =
+    block.type;
+
+  if (!type || !block[type]) {
+    return '';
+  }
+
+  const data =
+    block[type];
+
+  if (
+    !data.rich_text
+  ) {
+    return '';
+  }
+
+  return data.rich_text
+    .map(
+      item =>
+        item.plain_text ||
+        (
+          item.text &&
+          item.text.content
+        ) ||
+        ''
+    )
+    .join('');
+}
+
+
+// ============================================================================
+// 45 — DOSSIER DOCUMENTÉ
+// ============================================================================
+
+function transfert35_dossierDocumente_(dossier) {
+  if (!dossier) {
+    return false;
+  }
+
+  const statut =
+    normalize_(
+      transfert35_prop_(
+        dossier,
+        ['Statut documentaire']
+      )
+    );
+
+  if (
+    statut === 'dossier constitue' ||
+    statut === 'dossier documente'
+  ) {
+    return true;
+  }
+
+  const blocks =
+    transfert35_blocks_(
+      dossier.id
+    );
+
+  const text =
+    normalize_(
+      blocks
+        .map(
+          transfert35_blockText_
+        )
+        .join('\n')
+    );
+
+  return (
+    text.indexOf(
+      'recherche documentaire'
+    ) !== -1 &&
+    text.indexOf(
+      'sources'
+    ) !== -1
+  );
+}
+
+
+// ============================================================================
+// 46 — RECHERCHE DU DOSSIER ASSOCIÉ
+// ============================================================================
+
+function transfert35_findDossier_(radar) {
+  const pages =
+    queryDataSourceAll_(
+      CONFIG.DOSSIERS_DATA_SOURCE_ID
+    );
+
+  const cibleNom =
+    normalize_(
+      radar.nom
+    );
+
+  const cibleSujet =
+    normalize_(
+      radar.sujet
+    );
+
+  const cibleTaxon =
+    normalize_(
+      radar.taxon
+    );
+
+  for (const page of pages) {
+    const relation =
+      findProperty_(
+        page,
+        ['Radar scientifique']
+      );
+
+    if (
+      relation &&
+      relation.type === 'relation' &&
+      relation.relation
+    ) {
+      const ids =
+        relation.relation.map(
+          x => x.id
+        );
+
+      if (
+        ids.indexOf(
+          radar.id
+        ) !== -1
+      ) {
+        return page;
+      }
+    }
+  }
+
+  for (const page of pages) {
+    const nom =
+      normalize_(
+        transfert35_prop_(
+          page,
+          ['Nom']
+        )
+      );
+
+    const sujet =
+      normalize_(
+        transfert35_prop_(
+          page,
+          ['Sujet']
+        )
+      );
+
+    const taxon =
+      normalize_(
+        transfert35_prop_(
+          page,
+          ['Taxon']
+        )
+      );
+
+    if (
+      cibleNom &&
+      nom === cibleNom
+    ) {
+      return page;
+    }
+
+    if (
+      cibleSujet &&
+      sujet &&
+      sujet === cibleSujet
+    ) {
+      return page;
+    }
+
+    if (
+      cibleTaxon &&
+      taxon &&
+      taxon === cibleTaxon &&
+      (
+        !cibleSujet ||
+        !sujet ||
+        sujet === cibleSujet
+      )
+    ) {
+      return page;
+    }
+  }
+
+  return null;
+}
+
+
+// ============================================================================
+// 47 — RECHERCHE CONTENU EXISTANT
+// ============================================================================
+
+function transfert35_existingContent_(radar) {
+  const pages =
+    queryDataSourceAll_(
+      CONFIG.CONTENUS_DATA_SOURCE_ID
+    );
+
+  const cible =
+    normalize_(
+      radar.nom
+    );
+
+  for (const page of pages) {
+    const nom =
+      normalize_(
+        transfert35_prop_(
+          page,
+          ['Nom']
+        )
+      );
+
+    if (
+      cible &&
+      nom === cible
+    ) {
+      return page;
+    }
+  }
+
+  return null;
+}
+
+
+// ============================================================================
+// 48 — SCHÉMA CONTENUS
+// ============================================================================
+
+function transfert35_schema_() {
+  return getDataSource_(
+    CONFIG.CONTENUS_DATA_SOURCE_ID
+  );
+}
+
+
+function transfert35_findSchemaProperty_(
+  schema,
+  names
+) {
+  const properties =
+    schema.properties || {};
+
+  const wanted =
+    Array.isArray(names)
+      ? names
+      : [names];
+
+  for (const name of wanted) {
+    if (
+      properties[name]
+    ) {
+      return {
+        name: name,
+        definition:
+          properties[name]
+      };
+    }
+  }
+
+  const normalized =
+    wanted.map(
+      normalize_
+    );
+
+  for (const key in properties) {
+    if (
+      normalized.indexOf(
+        normalize_(key)
+      ) !== -1
+    ) {
+      return {
+        name: key,
+        definition:
+          properties[key]
+      };
+    }
+  }
+
+  return null;
+}
+
+
+function transfert35_cleanMultiSelect_(
+  value,
+  schemaProperty
+) {
+  if (
+    !value ||
+    !schemaProperty
+  ) {
+    return [];
+  }
+
+  const options =
+    schemaProperty.multi_select &&
+    schemaProperty.multi_select.options
+      ? schemaProperty.multi_select.options
+      : [];
+
+  const allowed =
+    options.map(
+      x =>
+        normalize_(
+          x.name
+        )
+    );
+
+  return String(value)
+    .split(',')
+    .map(
+      x => clean_(x)
+    )
+    .filter(Boolean)
+    .filter(
+      x =>
+        allowed.indexOf(
+          normalize_(x)
+        ) !== -1
+    )
+    .map(
+      x => ({
+        name: x
+      })
+    );
+}
+
+
+// ============================================================================
+// 49 — PROPRIÉTÉS CONTENUS
+// ============================================================================
+
+function transfert35_contentProperties_(
+  radar,
+  schema
+) {
+  const properties = {};
+
+  const mapText = [
+    ['Sujet', ['Sujet'], 'sujet'],
+    ['Taxon', ['Taxon'], 'taxon'],
+    [
+      'Localisation',
+      ['Localisation'],
+      'localisation'
+    ],
+    ['Résumé', ['Résumé'], 'resume'],
+    ['Auteurs', ['Auteurs'], 'auteurs'],
+    ['Notes', ['Notes'], 'notes']
+  ];
+
+  const title =
+    transfert35_findSchemaProperty_(
+      schema,
+      ['Nom']
+    );
+
+  if (title) {
+    properties[title.name] =
+      titleValue_(
+        radar.nom ||
+        radar.sujet ||
+        'Contenu'
+      );
+  }
+
+  for (const row of mapText) {
+    const schemaProp =
+      transfert35_findSchemaProperty_(
+        schema,
+        row[1]
+      );
+
+    if (
+      !schemaProp
+    ) {
+      continue;
+    }
+
+    if (
+      schemaProp.definition.type ===
+      'rich_text'
+    ) {
+      properties[schemaProp.name] =
+        richTextValueForNotion_(
+          radar[row[2]]
+        );
+    }
+  }
+
+  const doiProp =
+    transfert35_findSchemaProperty_(
+      schema,
+      ['DOI']
+    );
+
+  if (
+    doiProp &&
+    doiProp.definition.type ===
+      'url' &&
+    radar.doi
+  ) {
+    properties[doiProp.name] =
+      urlValue_(
+        radar.doi
+      );
+  }
+
+  const sourceProp =
+    transfert35_findSchemaProperty_(
+      schema,
+      ['Source primaire']
+    );
+
+  if (
+    sourceProp &&
+    sourceProp.definition.type ===
+      'url' &&
+    radar.sourcePrimaire
+  ) {
+    properties[sourceProp.name] =
+      urlValue_(
+        radar.sourcePrimaire
+      );
+  }
+
+  const dateProp =
+    transfert35_findSchemaProperty_(
+      schema,
+      ['Date de publication']
+    );
+
+  if (
+    dateProp &&
+    dateProp.definition.type ===
+      'date' &&
+    radar.datePublication
+  ) {
+    properties[dateProp.name] = {
+      date: {
+        start:
+          radar.datePublication
+      }
+    };
+  }
+
+  const natureProp =
+    transfert35_findSchemaProperty_(
+      schema,
+      ['Nature du sujet']
+    );
+
+  if (
+    natureProp &&
+    natureProp.definition.type ===
+      'select' &&
+    radar.natureSujet
+  ) {
+    const options =
+      natureProp.definition
+        .select &&
+      natureProp.definition.select
+        .options
+        ? natureProp.definition.select.options
+        : [];
+
+    const found =
+      options.find(
+        x =>
+          normalize_(x.name) ===
+          normalize_(
+            radar.natureSujet
+          )
+      );
+
+    if (found) {
+      properties[
+        natureProp.name
+      ] = {
+        select: {
+          name: found.name
+        }
+      };
+    }
+  }
+
+  const formatProp =
+    transfert35_findSchemaProperty_(
+      schema,
+      ['Format']
+    );
+
+  if (
+    formatProp &&
+    formatProp.definition.type ===
+      'multi_select' &&
+    radar.format
+  ) {
+    const values =
+      transfert35_cleanMultiSelect_(
+        radar.format,
+        formatProp.definition
+      );
+
+    properties[
+      formatProp.name
+    ] = {
+      multi_select:
+        values
+    };
+  }
+
+  return properties;
+}
+
+
+// ============================================================================
+// 50 — CORPS DU CONTENU : TOUTES LES DONNÉES
+// ============================================================================
+
+function transfert35_body_(
+  radar,
+  dossier
+) {
+  const blocks = [];
+
+  blocks.push(
+    heading2_(
+      'Provenance — transfert depuis le Radar'
+    )
+  );
+
+  blocks.push(
+    paragraph_(
+      'Page Radar : ' +
+      radar.id
+    )
+  );
+
+  if (radar.url) {
+    blocks.push(
+      paragraph_(
+        'URL Radar : ' +
+        radar.url
+      )
+    );
+  }
+
+  if (dossier) {
+    blocks.push(
+      paragraph_(
+        'Page Dossier : ' +
+        dossier.id
+      )
+    );
+
+    if (dossier.url) {
+      blocks.push(
+        paragraph_(
+          'URL Dossier : ' +
+          dossier.url
+        )
+      );
+    }
+  }
+
+  blocks.push(
+    heading2_(
+      'Données complètes du Radar'
+    )
+  );
+
+  const radarRows = [
+    ['Nom', radar.nom],
+    ['Sujet', radar.sujet],
+    ['Taxon', radar.taxon],
+    [
+      'Nature du sujet',
+      radar.natureSujet
+    ],
+    [
+      'Localisation',
+      radar.localisation
+    ],
+    ['Résumé', radar.resume],
+    ['Auteurs', radar.auteurs],
+    [
+      'Date de publication',
+      radar.datePublication
+    ],
+    ['DOI', radar.doi],
+    [
+      'Source primaire',
+      radar.sourcePrimaire
+    ],
+    ['Notes', radar.notes],
+    [
+      'Score éditorial',
+      radar.scoreEditorial
+    ],
+    [
+      'Potentiel PVV',
+      radar.potentielPVV
+    ],
+    [
+      'Type de découverte',
+      radar.typeDecouverte
+    ],
+    [
+      'Source de détection',
+      radar.sourceDetection
+    ],
+    ['Domaine', radar.domaine],
+    ['Confiance', radar.confiance],
+    ['Format', radar.format],
+    [
+      'Date de détection',
+      radar.dateDetection
+    ],
+    [
+      'Déjà dans les contenus',
+      radar.dejaDansContenus
+        ? 'true'
+        : 'false'
+    ],
+    [
+      'Sujet retenu',
+      radar.sujetRetenu
+        ? 'true'
+        : 'false'
+    ],
+    [
+      'Recherche documentaire',
+      radar.rechercheDocumentaire
+        ? 'true'
+        : 'false'
+    ],
+    [
+      'Statut radar',
+      radar.statutRadar
+    ],
+    [
+      'Date de création Notion',
+      radar.createdTime
+    ]
+  ];
+
+  for (const row of radarRows) {
+    if (
+      row[1] === undefined ||
+      row[1] === null ||
+      row[1] === ''
+    ) {
+      continue;
+    }
+
+    blocks.push(
+      paragraph_(
+        row[0] +
+        ' : ' +
+        String(row[1])
+      )
+    );
+  }
+
+  if (dossier) {
+    blocks.push(
+      heading2_(
+        'Documentation du Dossier'
+      )
+    );
+
+    const dossierBlocks =
+      transfert35_blocks_(
+        dossier.id
+      );
+
+    if (!dossierBlocks.length) {
+      blocks.push(
+        paragraph_(
+          'Aucun bloc documentaire récupérable.'
+        )
+      );
+    }
+
+    for (
+      const block of dossierBlocks
+    ) {
+      const text =
+        transfert35_blockText_(
+          block
+        );
+
+      if (text) {
+        blocks.push(
+          paragraph_(
+            text
+          )
+        );
+      }
+    }
+  }
+
+  return blocks;
+}
+
+
+// ============================================================================
+// 51 — CRÉATION DU CONTENU
+// ============================================================================
+
+function transfert35_create_(
+  radar,
+  dossier
+) {
+  const existing =
+    transfert35_existingContent_(
+      radar
+    );
+
+  if (existing) {
+    Logger.log(
+      'CONTENU EXISTANT : ' +
+      radar.nom
+    );
+
+    return existing;
+  }
+
+  const schema =
+    transfert35_schema_();
+
+  const properties =
+    transfert35_contentProperties_(
+      radar,
+      schema
+    );
+
+  const page =
+    createPage_(
+      CONFIG.CONTENUS_DATA_SOURCE_ID,
+      properties
+    );
+
+  const blocks =
+    transfert35_body_(
+      radar,
+      dossier
+    );
+
+  appendBlocks_(
+    page.id,
+    blocks
+  );
+
+  const verify =
+    notionRequest_(
+      'get',
+      '/pages/' +
+      page.id
+    );
+
+  const title =
+    transfert35_prop_(
+      verify,
+      ['Nom']
+    );
+
+  if (
+    !title ||
+    normalize_(title) !==
+      normalize_(
+        radar.nom ||
+        radar.sujet ||
+        'Contenu'
+      )
+  ) {
+    throw new Error(
+      'Vérification du Contenu créé impossible pour : ' +
+      radar.nom
+    );
+  }
+
+  return verify;
+}
+
+
+// ============================================================================
+// 52 — ARCHIVAGE RADAR APRÈS TRANSFERT
+// ============================================================================
+
+function transfert35_deleteRadar_(
+  radar
+) {
+  Logger.log(
+    'ARCHIVAGE RADAR : ' +
+    radar.nom
+  );
+
+  archiverPage_(
+    radar.id
+  );
+}
+
+
+// ============================================================================
+// 53 — ÉLIGIBILITÉ TRANSFERT
+// ============================================================================
+
+function sujetEligibleTransfert_(
+  radar,
+  dossier
+) {
+  if (
+    !radar.sujetRetenu
+  ) {
+    return false;
+  }
+
+  if (
+    !dossier
+  ) {
+    return false;
+  }
+
+  return transfert35_dossierDocumente_(
+    dossier
+  );
+}
+
+
+// ============================================================================
+// 54 — TEST TRANSFERT LECTURE SEULE
+// ============================================================================
+
+function testTransfertRadarVersContenus() {
+  Logger.log(
+    '========================================'
+  );
+
+  Logger.log(
+    'TEST TRANSFERT RADAR → CONTENUS'
+  );
+
+  Logger.log(
+    'LECTURE SEULE — AUCUNE ÉCRITURE'
+  );
+
+  Logger.log(
+    '========================================'
+  );
+
+  const pages =
+    queryDataSourceAll_(
+      CONFIG.RADAR_DATA_SOURCE_ID
+    );
+
+  let eligible = 0;
+
+  for (const page of pages) {
+    const radar =
+      transfert35_readRadar_(
+        page
+      );
+
+    if (
+      !radar.sujetRetenu
+    ) {
+      continue;
+    }
+
+    Logger.log(
+      '----------------------------------------'
+    );
+
+    Logger.log(
+      'SUJET RETENU : ' +
+      radar.nom
+    );
+
+    const dossier =
+      transfert35_findDossier_(
+        radar
+      );
+
+    Logger.log(
+      'Dossier : ' +
+      (
+        dossier
+          ? transfert35_prop_(
+              dossier,
+              ['Nom']
+            )
+          : 'NON TROUVÉ'
+      )
+    );
+
+    const documente =
+      dossier
+        ? transfert35_dossierDocumente_(
+            dossier
+          )
+        : false;
+
+    Logger.log(
+      'Recherche documentaire terminée : ' +
+      (
+        documente
+          ? 'OUI'
+          : 'NON'
+      )
+    );
+
+    const existing =
+      transfert35_existingContent_(
+        radar
+      );
+
+    Logger.log(
+      'Contenu déjà présent : ' +
+      (
+        existing
+          ? 'OUI'
+          : 'NON'
+      )
+    );
+
+    if (
+      sujetEligibleTransfert_(
+        radar,
+        dossier
+      )
+    ) {
+      eligible++;
+
+      Logger.log(
+        '>>> ÉLIGIBLE AU TRANSFERT'
+      );
+    } else {
+      Logger.log(
+        '>>> NON ÉLIGIBLE'
+      );
+    }
+  }
+
+  Logger.log(
+    '========================================'
+  );
+
+  Logger.log(
+    'SUJETS ÉLIGIBLES : ' +
+    eligible
+  );
+
+  Logger.log(
+    'TEST TERMINÉ — AUCUNE ÉCRITURE'
+  );
+}
+
+
+// ============================================================================
+// 55 — TRANSFERT RÉEL
+// ============================================================================
+
+function lancerTransfertRadarVersContenus() {
+  Logger.log(
+    '========================================'
+  );
+
+  Logger.log(
+    'TRANSFERT RADAR → CONTENUS'
+  );
+
+  Logger.log(
+    'MODE RÉEL — ÉCRITURE + ARCHIVAGE APRÈS VÉRIFICATION'
+  );
+
+  Logger.log(
+    '========================================'
+  );
+
+  const pages =
+    queryDataSourceAll_(
+      CONFIG.RADAR_DATA_SOURCE_ID
+    );
+
+  let transferes = 0;
+
+  for (const page of pages) {
+    const radar =
+      transfert35_readRadar_(
+        page
+      );
+
+    if (
+      !radar.sujetRetenu
+    ) {
+      continue;
+    }
+
+    Logger.log(
+      '----------------------------------------'
+    );
+
+    Logger.log(
+      'SUJET RETENU : ' +
+      radar.nom
+    );
+
+    try {
+      const dossier =
+        transfert35_findDossier_(
+          radar
+        );
+
+      if (
+        !dossier
+      ) {
+        Logger.log(
+          'Dossier introuvable — transfert annulé.'
+        );
+
+        continue;
+      }
+
+      if (
+        !transfert35_dossierDocumente_(
+          dossier
+        )
+      ) {
+        Logger.log(
+          'Documentation incomplète — transfert annulé.'
+        );
+
+        continue;
+      }
+
+      const contenu =
+        transfert35_create_(
+          radar,
+          dossier
+        );
+
+      if (
+        !contenu ||
+        !contenu.id
+      ) {
+        throw new Error(
+          'Le Contenu n’a pas pu être créé ou retrouvé.'
+        );
+      }
+
+      const verification =
+        notionRequest_(
+          'get',
+          '/pages/' +
+          contenu.id
+        );
+
+      const titreVerification =
+        transfert35_prop_(
+          verification,
+          ['Nom']
+        );
+
+      if (
+        normalize_(
+          titreVerification
+        ) !==
+        normalize_(
+          radar.nom ||
+          radar.sujet
+        )
+      ) {
+        throw new Error(
+          'Échec de vérification finale du Contenu.'
+        );
+      }
+
+      transfert35_deleteRadar_(
+        radar
+      );
+
+      transferes++;
+
+      Logger.log(
+        'TRANSFERT TERMINÉ : ' +
+        radar.nom
+      );
+
+    } catch (e) {
+      Logger.log(
+        'ERREUR TRANSFERT ' +
+        radar.nom +
+        ' → ' +
+        e.message
+      );
+    }
+  }
+
+  Logger.log(
+    '========================================'
+  );
+
+  Logger.log(
+    'TRANSFERTS TERMINÉS : ' +
+    transferes
+  );
+
+  Logger.log(
+    'FIN DU TRANSFERT RADAR → CONTENUS'
+  );
+}
+
+
+// ============================================================================
+// 56 — MOTEUR GLOBAL
+// ============================================================================
+
+function lancerMoteurGlobalPassonsAuVert() {
+  Logger.log(
+    '========================================'
+  );
+
+  Logger.log(
+    'PASSONS AU VERT — MOTEUR GLOBAL'
+  );
+
+  Logger.log(
+    '========================================'
+  );
+
+  lancerMoteurDocumentaire();
+
+  lancerTransfertRadarVersContenus();
+
+  Logger.log(
+    '========================================'
+  );
+
+  Logger.log(
+    'MOTEUR GLOBAL TERMINÉ'
+  );
+
+  Logger.log(
+    '========================================'
+  );
+}
+
+
+// ============================================================================
+// FIN DU SCRIPT
+// ============================================================================
