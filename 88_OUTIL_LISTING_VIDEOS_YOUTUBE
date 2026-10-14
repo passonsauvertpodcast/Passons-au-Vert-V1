@@ -1,0 +1,515 @@
+/**
+ * ================================================================
+ * PASSONS AU VERT
+ * LISTING COMPLET DES VIDÉOS YOUTUBE
+ * ================================================================
+ *
+ * RÔLE :
+ * - Récupérer toutes les vidéos de la chaîne YouTube.
+ * - Éliminer les doublons éventuels sur l'ID YouTube.
+ * - Afficher titre, ID et date de publication.
+ *
+ * IMPORTANT :
+ * - Ne modifie PAS Notion.
+ * - Ne modifie PAS les vidéos.
+ * - Ne modifie PAS les pages existantes.
+ * - N'utilise PAS YOUTUBE_API_KEY.
+ * - Utilise le service avancé YouTube déjà validé dans le fichier 10.
+ *
+ * ================================================================
+ */
+
+
+/* ================================================================
+   1. FONCTION PRINCIPALE
+   ================================================================ */
+
+function listerToutesLesVideosYouTube() {
+
+  Logger.log(
+    '============================================================'
+  );
+
+  Logger.log(
+    'LISTING COMPLET DES VIDÉOS YOUTUBE'
+  );
+
+  Logger.log(
+    '============================================================'
+  );
+
+
+  /*
+   * ------------------------------------------------------------
+   * RÉCUPÉRATION DE LA CHAÎNE
+   * ------------------------------------------------------------
+   */
+
+  const chaine =
+    recupererChaineYouTubeListing88_();
+
+
+  if (
+    !chaine ||
+    !chaine.id
+  ) {
+
+    throw new Error(
+      'Impossible de récupérer la chaîne YouTube.'
+    );
+
+  }
+
+
+  Logger.log(
+    'Chaîne : ' +
+    (
+      chaine.snippet &&
+      chaine.snippet.title
+        ? chaine.snippet.title
+        : '(sans nom)'
+    )
+  );
+
+  Logger.log(
+    'ID chaîne : ' +
+    chaine.id
+  );
+
+
+  /*
+   * ------------------------------------------------------------
+   * PLAYLIST DES UPLOADS
+   * ------------------------------------------------------------
+   */
+
+  const uploadsPlaylistId =
+    chaine.contentDetails &&
+    chaine.contentDetails.relatedPlaylists &&
+    chaine.contentDetails.relatedPlaylists.uploads;
+
+
+  if (!uploadsPlaylistId) {
+
+    throw new Error(
+      'Impossible de récupérer la playlist des vidéos de la chaîne.'
+    );
+
+  }
+
+
+  Logger.log(
+    'Playlist uploads : ' +
+    uploadsPlaylistId
+  );
+
+
+  /*
+   * ------------------------------------------------------------
+   * RÉCUPÉRATION BRUTE
+   * ------------------------------------------------------------
+   */
+
+  const videosBrutes =
+    recupererVideosYouTubeListing88_(
+      uploadsPlaylistId
+    );
+
+
+  Logger.log(
+    'Entrées récupérées avant dédoublonnage : ' +
+    videosBrutes.length
+  );
+
+
+  /*
+   * ------------------------------------------------------------
+   * DÉDOUBLONNAGE PAR ID YOUTUBE
+   * ------------------------------------------------------------
+   *
+   * L'ID YouTube est l'identifiant unique de la vidéo.
+   * Deux entrées portant le même ID représentent donc
+   * la même vidéo et une seule doit rester dans le listing.
+   */
+
+  const videos =
+    dedoublonnerVideosYouTubeListing88_(
+      videosBrutes
+    );
+
+
+  const nombreDoublons =
+    videosBrutes.length -
+    videos.length;
+
+
+  Logger.log(
+    'Doublons supprimés : ' +
+    nombreDoublons
+  );
+
+  Logger.log(
+    'Vidéos uniques : ' +
+    videos.length
+  );
+
+
+  /*
+   * ------------------------------------------------------------
+   * TRI PAR DATE DE PUBLICATION
+   * ------------------------------------------------------------
+   */
+
+  videos.sort(function(a, b) {
+
+    return new Date(a.publishedAt) -
+      new Date(b.publishedAt);
+
+  });
+
+
+  /*
+   * ------------------------------------------------------------
+   * AFFICHAGE
+   * ------------------------------------------------------------
+   */
+
+  Logger.log(
+    '------------------------------------------------------------'
+  );
+
+  Logger.log(
+    'LISTING DES VIDÉOS UNIQUES'
+  );
+
+  Logger.log(
+    '------------------------------------------------------------'
+  );
+
+
+  videos.forEach(function(video, index) {
+
+    Logger.log(
+      (index + 1) +
+      '. ' +
+      video.title +
+      ' -> ' +
+      video.id +
+      ' | ' +
+      video.publishedAt
+    );
+
+  });
+
+
+  Logger.log(
+    '------------------------------------------------------------'
+  );
+
+  Logger.log(
+    'FIN DU LISTING : ' +
+    videos.length +
+    ' vidéos uniques'
+  );
+
+  Logger.log(
+    '============================================================'
+  );
+
+
+  return videos;
+
+}
+
+
+/* ================================================================
+   2. RÉCUPÉRATION DE LA CHAÎNE
+   ================================================================ */
+
+function recupererChaineYouTubeListing88_() {
+
+  const response =
+    YouTube.Channels.list(
+      'snippet,contentDetails,statistics',
+      {
+        mine: true
+      }
+    );
+
+
+  if (
+    !response ||
+    !response.items ||
+    response.items.length === 0
+  ) {
+
+    throw new Error(
+      'Aucune chaîne YouTube trouvée pour ce compte Google.'
+    );
+
+  }
+
+
+  const chaine =
+    response.items[0];
+
+
+  /*
+   * Vérification de sécurité :
+   * la chaîne doit être celle de Passons au Vert.
+   */
+
+  if (
+    chaine.id !==
+    'UCzoMXZ4ULhWdgHI9BhstN0w'
+  ) {
+
+    throw new Error(
+      'La chaîne YouTube détectée ne correspond pas ' +
+      'à Passons au Vert. ID détecté : ' +
+      chaine.id
+    );
+
+  }
+
+
+  return chaine;
+
+}
+
+
+/* ================================================================
+   3. RÉCUPÉRATION DE TOUTES LES ENTRÉES
+   ================================================================ */
+
+function recupererVideosYouTubeListing88_(
+  uploadsPlaylistId
+) {
+
+  const videos = [];
+
+  let pageToken = null;
+
+
+  do {
+
+    const params = {
+
+      playlistId:
+        uploadsPlaylistId,
+
+      maxResults:
+        50
+
+    };
+
+
+    if (pageToken) {
+
+      params.pageToken =
+        pageToken;
+
+    }
+
+
+    const response =
+      YouTube.PlaylistItems.list(
+        'snippet,contentDetails',
+        params
+      );
+
+
+    if (
+      response &&
+      response.items &&
+      response.items.length
+    ) {
+
+      response.items.forEach(
+        function(item) {
+
+          const videoId =
+            item.contentDetails &&
+            item.contentDetails.videoId;
+
+
+          const title =
+            item.snippet &&
+            item.snippet.title;
+
+
+          const publishedAt =
+            (
+              item.contentDetails &&
+              item.contentDetails.videoPublishedAt
+            ) ||
+            (
+              item.snippet &&
+              item.snippet.publishedAt
+            ) ||
+            '';
+
+
+          if (
+            videoId &&
+            title
+          ) {
+
+            videos.push({
+
+              id:
+                videoId,
+
+              title:
+                title,
+
+              publishedAt:
+                publishedAt
+
+            });
+
+          }
+
+        }
+      );
+
+    }
+
+
+    pageToken =
+      response.nextPageToken ||
+      null;
+
+
+  } while (pageToken);
+
+
+  return videos;
+
+}
+
+
+/* ================================================================
+   4. DÉDOUBLONNAGE
+   ================================================================ */
+
+function dedoublonnerVideosYouTubeListing88_(
+  videos
+) {
+
+  const videosUniques = [];
+
+  const idsDejaVus = {};
+
+
+  videos.forEach(function(video) {
+
+    if (
+      !idsDejaVus[video.id]
+    ) {
+
+      idsDejaVus[video.id] = true;
+
+      videosUniques.push(
+        video
+      );
+
+    }
+
+  });
+
+
+  return videosUniques;
+
+}
+
+
+/* ================================================================
+   5. TEST COMPLET
+   ================================================================ */
+
+function testerListingVideosYouTube88() {
+
+  Logger.log(
+    '============================================================'
+  );
+
+  Logger.log(
+    'TEST DU LISTING YOUTUBE — FICHIER 88'
+  );
+
+  Logger.log(
+    '============================================================'
+  );
+
+
+  const videos =
+    listerToutesLesVideosYouTube();
+
+
+  Logger.log(
+    '------------------------------------------------------------'
+  );
+
+  Logger.log(
+    'TEST TERMINÉ'
+  );
+
+  Logger.log(
+    'Vidéos uniques récupérées : ' +
+    videos.length
+  );
+
+  Logger.log(
+    '------------------------------------------------------------'
+  );
+
+
+  if (
+    videos.length === 0
+  ) {
+
+    throw new Error(
+      'Le listing ne contient aucune vidéo.'
+    );
+
+  }
+
+
+  Logger.log(
+    'Première vidéo : ' +
+    videos[0].title +
+    ' -> ' +
+    videos[0].id
+  );
+
+
+  Logger.log(
+    'Dernière vidéo : ' +
+    videos[videos.length - 1].title +
+    ' -> ' +
+    videos[videos.length - 1].id
+  );
+
+
+  Logger.log(
+    '============================================================'
+  );
+
+  Logger.log(
+    'TEST TERMINÉ — AUCUNE MODIFICATION'
+  );
+
+  Logger.log(
+    '============================================================'
+  );
+
+
+  return videos;
+
+}
+
+
+/* ================================================================
+   FIN DU FICHIER 88
+   ================================================================ */
