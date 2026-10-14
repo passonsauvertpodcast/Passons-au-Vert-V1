@@ -1,0 +1,1945 @@
+/**
+ * ================================================================
+ * PASSONS AU VERT
+ * SYNCHRONISATION YOUTUBE → NOTION
+ * ================================================================
+ *
+ * Fonctionnement :
+ *
+ * 1. Récupère les vidéos présentes sur la chaîne YouTube.
+ * 2. Récupère leurs statistiques publiques actuelles.
+ * 3. Récupère les pages existantes de la base Notion.
+ * 4. Associe UNIQUEMENT par ID YouTube déjà présent dans Notion.
+ * 5. Met à jour :
+ *
+ *      Vues
+ *      Variation vues
+ *      Abonnés gagnés
+ *
+ * 6. Récupère le nombre actuel d'abonnés de la chaîne.
+ * 7. Calcule la variation globale depuis la dernière synchronisation.
+ *
+ * IMPORTANT :
+ * - Aucun nouveau contenu Notion n'est créé.
+ * - Aucun titre n'est utilisé pour faire une correspondance.
+ * - Aucun ID YouTube n'est modifié.
+ * - Aucun ID n'est inventé ou découpé.
+ * - Aucun "abonné perdu" n'est enregistré.
+ *
+ * PRÉREQUIS :
+ * - API YouTube Data activée
+ * - API YouTube Analytics activée
+ * - service avancé "YouTube" déjà utilisé par Code.gs
+ * - service avancé "YouTubeAnalytics" activé dans Apps Script
+ * - NOTION_TOKEN disponible dans Notion Token.gs
+ *
+ * ================================================================
+ */
+
+
+/* ================================================================
+   CONFIGURATION
+   ================================================================ */
+
+const SYNC_YT_NOTION_CONFIG = {
+
+  NOTION_DATABASE_ID:
+    '698fdf4d-7160-40c4-ba06-9ce158c55ad4',
+
+  // Période utilisée pour "Abonnés gagnés".
+  // 28 jours = période glissante.
+  ANALYTICS_DAYS: 28,
+
+  // Noms exacts des propriétés Notion.
+  PROP_ID: 'Vidéos YouTube',
+  PROP_VIEWS: 'Vues',
+  PROP_VIEWS_VARIATION: 'Variation vues',
+  PROP_SUBSCRIBERS_GAINED: 'Abonnés gagnés',
+
+  // Mémoire locale du dernier nombre d'abonnés.
+  SCRIPT_PROPERTY_SUBSCRIBERS:
+    'PASSons_AU_VERT_YOUTUBE_ABONNES_PRECEDENTS',
+
+  // Mémoire locale de la dernière synchronisation.
+  SCRIPT_PROPERTY_LAST_SYNC:
+    'PASSONS_AU_VERT_YOUTUBE_DERNIERE_SYNC'
+};
+
+
+/* ================================================================
+   FONCTION PRINCIPALE
+   ================================================================ */
+
+/**
+ * Synchronisation complète YouTube → Notion.
+ *
+ * À lancer manuellement pour le premier test.
+ */
+function synchroniserYouTubeVersNotion() {
+
+  Logger.log('================================================');
+  Logger.log('PASSONS AU VERT — SYNCHRONISATION YOUTUBE → NOTION');
+  Logger.log('================================================');
+
+  if (typeof NOTION_TOKEN === 'undefined' || !NOTION_TOKEN) {
+    throw new Error(
+      'NOTION_TOKEN introuvable. Vérifier Notion Token.gs.'
+    );
+  }
+
+  /* ------------------------------------------------------------
+     1. Vérification de l'accès YouTube
+     ------------------------------------------------------------ */
+
+  const chaine =
+    recupererChaineYouTubePourSynchronisation();
+
+  if (!chaine || !chaine.id) {
+    throw new Error(
+      'Impossible de récupérer la chaîne YouTube.'
+    );
+  }
+
+  Logger.log(
+    'Chaîne : ' +
+    chaine.snippet.title +
+    ' (' +
+    chaine.id +
+    ')'
+  );
+
+
+  /* ------------------------------------------------------------
+     2. Récupération des vidéos YouTube
+     ------------------------------------------------------------ */
+
+  const videosYouTube =
+    recupererVideosYouTubeAvecStatistiques();
+
+  Logger.log(
+    'Vidéos YouTube récupérées : ' +
+    videosYouTube.length
+  );
+
+
+  /* ------------------------------------------------------------
+     3. Indexation par ID
+     ------------------------------------------------------------ */
+
+  const indexYouTube = {};
+
+  videosYouTube.forEach(function(video) {
+
+    if (!video.id) {
+      return;
+    }
+
+    indexYouTube[video.id] = video;
+
+  });
+
+
+  /* ------------------------------------------------------------
+     4. Récupération des pages Notion existantes
+     ------------------------------------------------------------ */
+
+  const pagesNotion =
+    recupererPagesNotionPourSynchronisation();
+
+  Logger.log(
+    'Pages Notion récupérées : ' +
+    pagesNotion.length
+  );
+
+
+  /* ------------------------------------------------------------
+     5. Synchronisation vidéo par vidéo
+     ------------------------------------------------------------ */
+
+  let pagesExaminees = 0;
+  let pagesModifiees = 0;
+  let pagesSansId = 0;
+  let pagesSansCorrespondance = 0;
+  let erreurs = 0;
+
+  pagesNotion.forEach(function(page) {
+
+    pagesExaminees++;
+
+    try {
+
+      const idTexte =
+        lireProprieteTexteNotion(
+          page,
+          SYNC_YT_NOTION_CONFIG.PROP_ID
+        );
+
+      if (!idTexte) {
+
+        pagesSansId++;
+
+        Logger.log(
+          '[IGNORÉ] Page sans ID YouTube : ' +
+          lireTitrePageSynchronisation(page)
+        );
+
+        return;
+      }
+
+
+      /* --------------------------------------------------------
+         IMPORTANT :
+         On ne découpe PAS arbitrairement une chaîne.
+
+         On recherche uniquement des IDs YouTube exacts
+         présents dans la valeur Notion.
+         -------------------------------------------------------- */
+
+      const idsTrouves =
+        extraireIdsYouTubeConnus(
+          idTexte,
+          indexYouTube
+        );
+
+      if (idsTrouves.length === 0) {
+
+        pagesSansCorrespondance++;
+
+        Logger.log(
+          '[IGNORÉ] Aucun ID YouTube connu pour : ' +
+          lireTitrePageSynchronisation(page) +
+          ' | valeur=' +
+          idTexte
+        );
+
+        return;
+      }
+
+
+      /* --------------------------------------------------------
+         Si plusieurs IDs sont réellement présents dans la page,
+         on conserve leur logique :
+
+         Vues = somme des vues des IDs.
+
+         Variation vues = somme des variations des IDs.
+
+         Abonnés gagnés = somme des abonnements attribués
+         aux vidéos concernées.
+         -------------------------------------------------------- */
+
+      let vuesActuelles = 0;
+      let videosAvecVues = 0;
+
+      let abonnesGagnes = 0;
+      let videosAvecAnalytics = 0;
+
+      idsTrouves.forEach(function(id) {
+
+        const video = indexYouTube[id];
+
+        if (!video) {
+          return;
+        }
+
+        if (
+          typeof video.viewCount === 'number'
+        ) {
+          vuesActuelles += video.viewCount;
+          videosAvecVues++;
+        }
+
+        if (
+          typeof video.subscribersGained === 'number'
+        ) {
+          abonnesGagnes += video.subscribersGained;
+          videosAvecAnalytics++;
+        }
+
+      });
+
+
+      /* --------------------------------------------------------
+         Lecture de l'ancienne valeur Vues.
+         -------------------------------------------------------- */
+
+      const anciennesVues =
+        lireProprieteNombreNotion(
+          page,
+          SYNC_YT_NOTION_CONFIG.PROP_VIEWS
+        );
+
+
+      /* --------------------------------------------------------
+         Calcul de Variation vues.
+         -------------------------------------------------------- */
+
+      let variationVues = null;
+
+      if (
+        anciennesVues !== null &&
+        videosAvecVues > 0
+      ) {
+
+        variationVues =
+          vuesActuelles - anciennesVues;
+
+      }
+
+
+      /* --------------------------------------------------------
+         Construction des propriétés à modifier.
+         -------------------------------------------------------- */
+
+      const proprietes = {};
+
+      if (videosAvecVues > 0) {
+
+        proprietes[
+          SYNC_YT_NOTION_CONFIG.PROP_VIEWS
+        ] = {
+          number: vuesActuelles
+        };
+
+      }
+
+
+      if (variationVues !== null) {
+
+        proprietes[
+          SYNC_YT_NOTION_CONFIG.PROP_VIEWS_VARIATION
+        ] = {
+          number: variationVues
+        };
+
+      }
+
+
+      /* --------------------------------------------------------
+         Abonnés gagnés.
+         -------------------------------------------------------- */
+
+      if (videosAvecAnalytics > 0) {
+
+        proprietes[
+          SYNC_YT_NOTION_CONFIG.PROP_SUBSCRIBERS_GAINED
+        ] = {
+          number: abonnesGagnes
+        };
+
+      }
+
+
+      /* --------------------------------------------------------
+         Mise à jour Notion
+         -------------------------------------------------------- */
+
+      if (Object.keys(proprietes).length === 0) {
+
+        Logger.log(
+          '[AUCUNE MODIFICATION] ' +
+          lireTitrePageSynchronisation(page)
+        );
+
+        return;
+      }
+
+
+      mettreAJourProprietesNotionSynchronisation(
+        page.id,
+        proprietes
+      );
+
+      pagesModifiees++;
+
+      Logger.log(
+        '[OK] ' +
+        lireTitrePageSynchronisation(page) +
+        ' | vues=' +
+        vuesActuelles +
+        ' | variation=' +
+        variationVues +
+        ' | abonnés gagnés=' +
+        (
+          videosAvecAnalytics > 0
+            ? abonnesGagnes
+            : 'non disponible'
+        )
+      );
+
+    } catch (e) {
+
+      erreurs++;
+
+      Logger.log(
+        '[ERREUR] Page ' +
+        page.id +
+        ' : ' +
+        e.message
+      );
+
+    }
+
+  });
+
+
+  /* ------------------------------------------------------------
+     6. Statistiques globales de la chaîne
+     ------------------------------------------------------------ */
+
+  const statistiquesChaine =
+    recupererStatistiquesGlobalesYouTube(
+      chaine.id
+    );
+
+
+  /* ------------------------------------------------------------
+     7. Variation globale des abonnés
+     ------------------------------------------------------------ */
+
+  const variationAbonnes =
+    calculerVariationAbonnes(
+      statistiquesChaine.subscriberCount
+    );
+
+
+  /* ------------------------------------------------------------
+     8. Enregistrement de la date de synchronisation
+     ------------------------------------------------------------ */
+
+  const maintenant =
+    new Date();
+
+  PropertiesService
+    .getScriptProperties()
+    .setProperty(
+      SYNC_YT_NOTION_CONFIG.SCRIPT_PROPERTY_LAST_SYNC,
+      maintenant.toISOString()
+    );
+
+
+  /* ------------------------------------------------------------
+     9. Rapport final
+     ------------------------------------------------------------ */
+
+  Logger.log('================================================');
+  Logger.log('SYNCHRONISATION TERMINÉE');
+  Logger.log('================================================');
+
+  Logger.log(
+    'Pages examinées : ' +
+    pagesExaminees
+  );
+
+  Logger.log(
+    'Pages modifiées : ' +
+    pagesModifiees
+  );
+
+  Logger.log(
+    'Pages sans ID : ' +
+    pagesSansId
+  );
+
+  Logger.log(
+    'Pages sans correspondance : ' +
+    pagesSansCorrespondance
+  );
+
+  Logger.log(
+    'Erreurs : ' +
+    erreurs
+  );
+
+  Logger.log(
+    'Abonnés actuels : ' +
+    statistiquesChaine.subscriberCount
+  );
+
+  Logger.log(
+    'Variation abonnés depuis dernière synchronisation : ' +
+    variationAbonnes
+  );
+
+  Logger.log(
+    'Période Analytics pour abonnés gagnés : ' +
+    SYNC_YT_NOTION_CONFIG.ANALYTICS_DAYS +
+    ' jours'
+  );
+
+  Logger.log('================================================');
+
+
+  return {
+    chaine: chaine.snippet.title,
+    chaineId: chaine.id,
+    videosYouTube: videosYouTube.length,
+    pagesNotion: pagesNotion.length,
+    pagesExaminees: pagesExaminees,
+    pagesModifiees: pagesModifiees,
+    pagesSansId: pagesSansId,
+    pagesSansCorrespondance: pagesSansCorrespondance,
+    erreurs: erreurs,
+    abonnesActuels:
+      statistiquesChaine.subscriberCount,
+    variationAbonnes:
+      variationAbonnes,
+    derniereSynchronisation:
+      maintenant.toISOString()
+  };
+}
+
+
+/* ================================================================
+   ALIAS — COMPATIBILITÉ AVEC LE DÉCLENCHEUR EXISTANT
+   ================================================================ */
+
+/**
+ * Alias conservant la compatibilité avec le déclencheur
+ * actuellement installé dans Apps Script.
+ *
+ * Le moteur principal reste :
+ * synchroniserYouTubeVersNotion()
+ *
+ * Le déclencheur historique appelle :
+ * synchroniserNotionYouTube()
+ */
+function synchroniserNotionYouTube() {
+
+  return synchroniserYouTubeVersNotion();
+
+}
+
+
+/* ================================================================
+   YOUTUBE — CHAÎNE
+   ================================================================ */
+
+function recupererChaineYouTubePourSynchronisation() {
+
+  const response =
+    YouTube.Channels.list(
+      'snippet,contentDetails,statistics',
+      {
+        mine: true
+      }
+    );
+
+  if (
+    !response.items ||
+    response.items.length === 0
+  ) {
+    throw new Error(
+      'Aucune chaîne YouTube trouvée pour ce compte.'
+    );
+  }
+
+  return response.items[0];
+}
+
+
+/* ================================================================
+   YOUTUBE — VIDÉOS + STATISTIQUES
+   ================================================================ */
+
+/**
+ * Récupère les vidéos de la playlist Uploads,
+ * puis leurs statistiques publiques.
+ *
+ * La récupération des statistiques est faite par lots.
+ */
+function recupererVideosYouTubeAvecStatistiques() {
+
+  const chaine =
+    recupererChaineYouTubePourSynchronisation();
+
+  const uploadsPlaylistId =
+    chaine.contentDetails
+      .relatedPlaylists
+      .uploads;
+
+  const videos = [];
+
+  let pageToken = null;
+
+  do {
+
+    const params = {
+      playlistId: uploadsPlaylistId,
+      maxResults: 50
+    };
+
+    if (pageToken) {
+      params.pageToken = pageToken;
+    }
+
+    const response =
+      YouTube.PlaylistItems.list(
+        'snippet,contentDetails',
+        params
+      );
+
+    if (
+      response.items &&
+      response.items.length
+    ) {
+
+      response.items.forEach(function(item) {
+
+        const videoId =
+          item.contentDetails.videoId;
+
+        if (!videoId) {
+          return;
+        }
+
+        videos.push({
+          id: videoId,
+          title:
+            item.snippet &&
+            item.snippet.title
+              ? item.snippet.title
+              : '',
+          publishedAt:
+            item.contentDetails.videoPublishedAt ||
+            (
+              item.snippet
+                ? item.snippet.publishedAt
+                : null
+            )
+        });
+
+      });
+
+    }
+
+    pageToken =
+      response.nextPageToken || null;
+
+  } while (pageToken);
+
+
+  /* ------------------------------------------------------------
+     Récupération des statistiques publiques
+     par lots de 50 vidéos.
+     ------------------------------------------------------------ */
+
+  const resultats = [];
+
+  for (
+    let i = 0;
+    i < videos.length;
+    i += 50
+  ) {
+
+    const lot =
+      videos.slice(i, i + 50);
+
+    const ids =
+      lot
+        .map(function(video) {
+          return video.id;
+        })
+        .join(',');
+
+    const statsResponse =
+      YouTube.Videos.list(
+        'snippet,contentDetails,statistics',
+        {
+          id: ids
+        }
+      );
+
+    const statsParId = {};
+
+    if (
+      statsResponse.items &&
+      statsResponse.items.length
+    ) {
+
+      statsResponse.items.forEach(
+        function(video) {
+
+          statsParId[video.id] = video;
+
+        }
+      );
+
+    }
+
+
+    lot.forEach(function(video) {
+
+      const youtubeVideo =
+        statsParId[video.id];
+
+      if (!youtubeVideo) {
+        return;
+      }
+
+      const statistiques =
+        youtubeVideo.statistics || {};
+
+      resultats.push({
+
+        id: video.id,
+
+        title:
+          youtubeVideo.snippet &&
+          youtubeVideo.snippet.title
+            ? youtubeVideo.snippet.title
+            : video.title,
+
+        publishedAt:
+          video.publishedAt,
+
+        viewCount:
+          convertirNombreYouTube(
+            statistiques.viewCount
+          ),
+
+        likeCount:
+          convertirNombreYouTube(
+            statistiques.likeCount
+          ),
+
+        commentCount:
+          convertirNombreYouTube(
+            statistiques.commentCount
+          )
+
+      });
+
+    });
+
+  }
+
+
+  /* ------------------------------------------------------------
+     Analytics :
+     subscribersGained sur la période définie.
+     ------------------------------------------------------------ */
+
+  const analyticsParVideo =
+    recupererAnalyticsAbonnesParVideo();
+
+  resultats.forEach(function(video) {
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        analyticsParVideo,
+        video.id
+      )
+    ) {
+
+      video.subscribersGained =
+        analyticsParVideo[video.id];
+
+    } else {
+
+      video.subscribersGained = null;
+
+    }
+
+  });
+
+
+  return resultats;
+}
+
+
+/* ================================================================
+   YOUTUBE ANALYTICS — ABONNÉS PAR VIDÉO
+   ================================================================ */
+
+/**
+ * Récupère subscribersGained par vidéo
+ * sur les X derniers jours.
+ */
+function recupererAnalyticsAbonnesParVideo() {
+
+  const resultat = {};
+
+  const dates =
+    calculerPeriodeAnalytics(
+      SYNC_YT_NOTION_CONFIG.ANALYTICS_DAYS
+    );
+
+  let response;
+
+  try {
+
+    response =
+      YouTubeAnalytics.Reports.query({
+
+        ids: 'channel==MINE',
+
+        startDate: dates.startDate,
+
+        endDate: dates.endDate,
+
+        dimensions: 'video',
+
+        metrics:
+          'subscribersGained',
+
+        maxResults: 200,
+
+        sort: '-subscribersGained'
+
+      });
+
+  } catch (e) {
+
+    Logger.log(
+      '[ANALYTICS INDISPONIBLE] ' +
+      e.message
+    );
+
+    return resultat;
+  }
+
+
+  if (
+    !response ||
+    !response.rows
+  ) {
+
+    Logger.log(
+      '[ANALYTICS] Aucune donnée retournée.'
+    );
+
+    return resultat;
+  }
+
+
+  const indexColonnes = {};
+
+  if (
+    response.columnHeaders
+  ) {
+
+    response.columnHeaders.forEach(
+      function(header, index) {
+
+        indexColonnes[
+          header.name
+        ] = index;
+
+      }
+    );
+
+  }
+
+
+  const indexVideo =
+    indexColonnes.video;
+
+  const indexAbonnes =
+    indexColonnes.subscribersGained;
+
+
+  if (
+    indexVideo === undefined ||
+    indexAbonnes === undefined
+  ) {
+
+    Logger.log(
+      '[ANALYTICS] Colonnes attendues absentes.'
+    );
+
+    return resultat;
+  }
+
+
+  response.rows.forEach(function(row) {
+
+    const videoId =
+      row[indexVideo];
+
+    const abonnes =
+      Number(row[indexAbonnes]);
+
+    if (
+      videoId &&
+      isFinite(abonnes)
+    ) {
+
+      resultat[videoId] =
+        abonnes;
+
+    }
+
+  });
+
+
+  Logger.log(
+    '[ANALYTICS] Vidéos avec données abonnés : ' +
+    Object.keys(resultat).length
+  );
+
+
+  return resultat;
+}
+
+
+/* ================================================================
+   YOUTUBE — STATISTIQUES GLOBALES
+   ================================================================ */
+
+function recupererStatistiquesGlobalesYouTube(
+  channelId
+) {
+
+  const response =
+    YouTube.Channels.list(
+      'statistics',
+      {
+        id: channelId
+      }
+    );
+
+  if (
+    !response.items ||
+    response.items.length === 0
+  ) {
+    throw new Error(
+      'Impossible de récupérer les statistiques de la chaîne.'
+    );
+  }
+
+  const statistiques =
+    response.items[0].statistics || {};
+
+  return {
+
+    subscriberCount:
+      convertirNombreYouTube(
+        statistiques.subscriberCount
+      ),
+
+    viewCount:
+      convertirNombreYouTube(
+        statistiques.viewCount
+      ),
+
+    videoCount:
+      convertirNombreYouTube(
+        statistiques.videoCount
+      )
+
+  };
+}
+
+
+/* ================================================================
+   ABONNÉS — VARIATION GLOBALE
+   ================================================================ */
+
+function calculerVariationAbonnes(
+  abonnésActuels
+) {
+
+  const properties =
+    PropertiesService
+      .getScriptProperties();
+
+  const ancienneValeur =
+    properties.getProperty(
+      SYNC_YT_NOTION_CONFIG
+        .SCRIPT_PROPERTY_SUBSCRIBERS
+    );
+
+  if (
+    ancienneValeur === null
+  ) {
+
+    properties.setProperty(
+      SYNC_YT_NOTION_CONFIG
+        .SCRIPT_PROPERTY_SUBSCRIBERS,
+      String(abonnésActuels)
+    );
+
+    Logger.log(
+      '[ABONNÉS] Première mesure : ' +
+      abonnésActuels
+    );
+
+    return null;
+  }
+
+
+  const ancienne =
+    Number(ancienneValeur);
+
+  const variation =
+    abonnésActuels - ancienne;
+
+
+  properties.setProperty(
+    SYNC_YT_NOTION_CONFIG
+      .SCRIPT_PROPERTY_SUBSCRIBERS,
+    String(abonnésActuels)
+  );
+
+
+  return variation;
+}
+
+
+/* ================================================================
+   NOTION — RÉCUPÉRATION DES PAGES
+   ================================================================ */
+
+function recupererPagesNotionPourSynchronisation() {
+
+  const url =
+    'https://api.notion.com/v1/databases/' +
+    SYNC_YT_NOTION_CONFIG.NOTION_DATABASE_ID +
+    '/query';
+
+  const pages = [];
+
+  let startCursor = null;
+
+  do {
+
+    const payload = {
+      page_size: 100
+    };
+
+    if (startCursor) {
+      payload.start_cursor =
+        startCursor;
+    }
+
+    const response =
+      UrlFetchApp.fetch(
+        url,
+        {
+          method: 'post',
+
+          contentType:
+            'application/json',
+
+          headers: {
+            'Authorization':
+              'Bearer ' + NOTION_TOKEN,
+
+            'Notion-Version':
+              '2026-03-11'
+          },
+
+          payload:
+            JSON.stringify(payload),
+
+          muteHttpExceptions:
+            true
+        }
+      );
+
+
+    const code =
+      response.getResponseCode();
+
+    if (code < 200 || code >= 300) {
+
+      throw new Error(
+        'Erreur Notion lors de la récupération des pages : ' +
+        code +
+        ' — ' +
+        response.getContentText()
+      );
+
+    }
+
+
+    const data =
+      JSON.parse(
+        response.getContentText()
+      );
+
+
+    if (data.results) {
+
+      data.results.forEach(function(page) {
+
+        pages.push(page);
+
+      });
+
+    }
+
+
+    startCursor =
+      data.has_more
+        ? data.next_cursor
+        : null;
+
+  } while (startCursor);
+
+
+  return pages;
+}
+
+
+/* ================================================================
+   NOTION — LECTURE DU TITRE
+   ================================================================ */
+
+function lireTitrePageSynchronisation(
+  page
+) {
+
+  if (
+    !page.properties
+  ) {
+    return '(sans titre)';
+  }
+
+  const nom =
+    page.properties.Nom;
+
+  if (
+    !nom ||
+    !nom.title ||
+    !nom.title.length
+  ) {
+    return '(sans titre)';
+  }
+
+  return nom.title
+    .map(function(item) {
+
+      return item.plain_text || '';
+
+    })
+    .join('');
+}
+
+
+/* ================================================================
+   NOTION — LECTURE TEXTE
+   ================================================================ */
+
+function lireProprieteTexteNotion(
+  page,
+  nomPropriete
+) {
+
+  if (
+    !page.properties ||
+    !page.properties[nomPropriete]
+  ) {
+    return '';
+  }
+
+  const propriete =
+    page.properties[nomPropriete];
+
+
+  /* Rich text */
+
+  if (
+    propriete.rich_text &&
+    propriete.rich_text.length
+  ) {
+
+    return propriete.rich_text
+      .map(function(item) {
+
+        return item.plain_text || '';
+
+      })
+      .join('');
+
+  }
+
+
+  /* Title */
+
+  if (
+    propriete.title &&
+    propriete.title.length
+  ) {
+
+    return propriete.title
+      .map(function(item) {
+
+        return item.plain_text || '';
+
+      })
+      .join('');
+
+  }
+
+
+  /* URL */
+
+  if (
+    propriete.url
+  ) {
+
+    return propriete.url || '';
+
+  }
+
+
+  return '';
+}
+
+
+/* ================================================================
+   NOTION — LECTURE NOMBRE
+   ================================================================ */
+
+function lireProprieteNombreNotion(
+  page,
+  nomPropriete
+) {
+
+  if (
+    !page.properties ||
+    !page.properties[nomPropriete]
+  ) {
+    return null;
+  }
+
+  const propriete =
+    page.properties[nomPropriete];
+
+
+  if (
+    typeof propriete.number === 'number'
+  ) {
+
+    return propriete.number;
+
+  }
+
+
+  return null;
+}
+
+
+/* ================================================================
+   NOTION — MISE À JOUR
+   ================================================================ */
+
+function mettreAJourProprietesNotionSynchronisation(
+  pageId,
+  proprietes
+) {
+
+  const url =
+    'https://api.notion.com/v1/pages/' +
+    pageId;
+
+
+  const response =
+    UrlFetchApp.fetch(
+      url,
+      {
+        method: 'patch',
+
+        contentType:
+          'application/json',
+
+        headers: {
+
+          'Authorization':
+            'Bearer ' + NOTION_TOKEN,
+
+          'Notion-Version':
+            '2026-03-11'
+
+        },
+
+        payload:
+          JSON.stringify({
+            properties: proprietes
+          }),
+
+        muteHttpExceptions:
+          true
+      }
+    );
+
+
+  const code =
+    response.getResponseCode();
+
+
+  if (
+    code < 200 ||
+    code >= 300
+  ) {
+
+    throw new Error(
+      'Erreur mise à jour Notion : ' +
+      code +
+      ' — ' +
+      response.getContentText()
+    );
+
+  }
+}
+
+
+/* ================================================================
+   EXTRACTION SÛRE DES IDs YOUTUBE
+   ================================================================ */
+
+/**
+ * Recherche uniquement les IDs YouTube qui sont réellement
+ * connus dans l'index YouTube.
+ *
+ * Cela évite toute interprétation arbitraire d'une chaîne.
+ */
+function extraireIdsYouTubeConnus(
+  valeur,
+  indexYouTube
+) {
+
+  if (
+    !valeur ||
+    !indexYouTube
+  ) {
+    return [];
+  }
+
+
+  const resultat = [];
+
+
+  Object.keys(indexYouTube)
+    .forEach(function(id) {
+
+      if (
+        valeur.indexOf(id) !== -1
+      ) {
+
+        resultat.push(id);
+
+      }
+
+    });
+
+
+  return resultat.filter(
+    function(id, index, array) {
+
+      return array.indexOf(id) === index;
+
+    }
+  );
+}
+
+
+/* ================================================================
+   PÉRIODE ANALYTICS
+   ================================================================ */
+
+function calculerPeriodeAnalytics(
+  nombreDeJours
+) {
+
+  const aujourdHui =
+    new Date();
+
+  /*
+   * YouTube Analytics peut ne pas fournir les données
+   * du jour le plus récent.
+   *
+   * On termine donc à J-1.
+   */
+
+  const fin =
+    new Date(aujourdHui);
+
+  fin.setDate(
+    fin.getDate() - 1
+  );
+
+
+  const debut =
+    new Date(fin);
+
+  debut.setDate(
+    debut.getDate() -
+    (nombreDeJours - 1)
+  );
+
+
+  const timezone =
+    Session.getScriptTimeZone() ||
+    'Europe/Paris';
+
+
+  return {
+
+    startDate:
+      Utilities.formatDate(
+        debut,
+        timezone,
+        'yyyy-MM-dd'
+      ),
+
+    endDate:
+      Utilities.formatDate(
+        fin,
+        timezone,
+        'yyyy-MM-dd'
+      )
+
+  };
+}
+
+
+/* ================================================================
+   UTILITAIRE NOMBRE
+   ================================================================ */
+
+function convertirNombreYouTube(
+  valeur
+) {
+
+  if (
+    valeur === null ||
+    valeur === undefined ||
+    valeur === ''
+  ) {
+    return null;
+  }
+
+  const nombre =
+    Number(valeur);
+
+  if (
+    !isFinite(nombre)
+  ) {
+    return null;
+  }
+
+  return nombre;
+}
+
+
+/* ================================================================
+   TESTS
+   ================================================================ */
+
+/**
+ * Test sans modification de Notion.
+ *
+ * Permet de vérifier :
+ * - accès YouTube
+ * - statistiques de chaîne
+ * - Analytics
+ */
+function testerSynchronisationYouTube() {
+
+  Logger.log(
+    '===== TEST YOUTUBE ====='
+  );
+
+  const chaine =
+    recupererChaineYouTubePourSynchronisation();
+
+  Logger.log(
+    'Chaîne : ' +
+    chaine.snippet.title
+  );
+
+  Logger.log(
+    'ID : ' +
+    chaine.id
+  );
+
+  const stats =
+    recupererStatistiquesGlobalesYouTube(
+      chaine.id
+    );
+
+  Logger.log(
+    'Abonnés actuels : ' +
+    stats.subscriberCount
+  );
+
+  Logger.log(
+    'Vues chaîne : ' +
+    stats.viewCount
+  );
+
+  Logger.log(
+    'Nombre de vidéos : ' +
+    stats.videoCount
+  );
+
+
+  const analytics =
+    recupererAnalyticsAbonnesParVideo();
+
+  Logger.log(
+    'Vidéos avec données Analytics : ' +
+    Object.keys(analytics).length
+  );
+
+  Logger.log(
+    'Période Analytics : ' +
+    JSON.stringify(
+      calculerPeriodeAnalytics(
+        SYNC_YT_NOTION_CONFIG.ANALYTICS_DAYS
+      )
+    )
+  );
+
+  Logger.log(
+    '===== FIN DU TEST ====='
+  );
+
+  return {
+    chaine: chaine.snippet.title,
+    chaineId: chaine.id,
+    statistiques: stats,
+    analyticsVideos:
+      Object.keys(analytics).length
+  };
+}
+
+
+/* ================================================================
+   DIAGNOSTIC — ÉCART ENTRE UPLOADS ET VIDEOS.LIST
+   ================================================================ */
+
+/**
+ * DIAGNOSTIC LECTURE SEULE.
+ *
+ * Compare :
+ *
+ * 1. les entrées de la playlist Uploads ;
+ * 2. les vidéos uniques de cette playlist ;
+ * 3. les vidéos retournées par YouTube.Videos.list().
+ *
+ * OBJECTIF :
+ * déterminer précisément pourquoi le listing du fichier 88
+ * donne 56 vidéos uniques alors que le moteur de synchronisation
+ * peut éventuellement en retourner moins.
+ *
+ * IMPORTANT :
+ * - aucune modification de Notion ;
+ * - aucune modification de YouTube ;
+ * - aucune création de page ;
+ * - aucun changement de propriété ;
+ * - aucune modification de déclencheur.
+ */
+function diagnostiquerEcartVideosYouTube() {
+
+  Logger.log(
+    '============================================================'
+  );
+
+  Logger.log(
+    'DIAGNOSTIC ÉCART VIDÉOS YOUTUBE'
+  );
+
+  Logger.log(
+    '============================================================'
+  );
+
+
+  /* ------------------------------------------------------------
+     1. RÉCUPÉRATION DE LA CHAÎNE
+     ------------------------------------------------------------ */
+
+  const chaine =
+    recupererChaineYouTubePourSynchronisation();
+
+  if (
+    !chaine ||
+    !chaine.id
+  ) {
+    throw new Error(
+      'Impossible de récupérer la chaîne YouTube.'
+    );
+  }
+
+
+  Logger.log(
+    'Chaîne : ' +
+    chaine.snippet.title
+  );
+
+  Logger.log(
+    'ID : ' +
+    chaine.id
+  );
+
+
+  /* ------------------------------------------------------------
+     2. RÉCUPÉRATION DE LA PLAYLIST UPLOADS
+     ------------------------------------------------------------ */
+
+  const uploadsPlaylistId =
+    chaine.contentDetails &&
+    chaine.contentDetails.relatedPlaylists &&
+    chaine.contentDetails.relatedPlaylists.uploads;
+
+
+  if (!uploadsPlaylistId) {
+    throw new Error(
+      'Playlist Uploads introuvable.'
+    );
+  }
+
+
+  Logger.log(
+    'Playlist Uploads : ' +
+    uploadsPlaylistId
+  );
+
+
+  /* ------------------------------------------------------------
+     3. RÉCUPÉRATION DE TOUTES LES ENTRÉES
+     ------------------------------------------------------------ */
+
+  const videosPlaylist = [];
+
+  let pageToken = null;
+
+
+  do {
+
+    const params = {
+      playlistId:
+        uploadsPlaylistId,
+
+      maxResults:
+        50
+    };
+
+
+    if (pageToken) {
+
+      params.pageToken =
+        pageToken;
+
+    }
+
+
+    const response =
+      YouTube.PlaylistItems.list(
+        'snippet,contentDetails',
+        params
+      );
+
+
+    if (
+      response &&
+      response.items
+    ) {
+
+      response.items.forEach(
+        function(item) {
+
+          const videoId =
+            item.contentDetails &&
+            item.contentDetails.videoId;
+
+
+          if (!videoId) {
+            return;
+          }
+
+
+          videosPlaylist.push({
+
+            id:
+              videoId,
+
+            title:
+              item.snippet &&
+              item.snippet.title
+                ? item.snippet.title
+                : '',
+
+            publishedAt:
+              (
+                item.contentDetails &&
+                item.contentDetails.videoPublishedAt
+              ) ||
+              (
+                item.snippet &&
+                item.snippet.publishedAt
+              ) ||
+              ''
+
+          });
+
+        }
+      );
+
+    }
+
+
+    pageToken =
+      response.nextPageToken ||
+      null;
+
+
+  } while (pageToken);
+
+
+  Logger.log(
+    'Entrées playlist : ' +
+    videosPlaylist.length
+  );
+
+
+  /* ------------------------------------------------------------
+     4. DÉDOUBLONNAGE DES IDS
+     ------------------------------------------------------------ */
+
+  const playlistUniqueParId = {};
+  const videosUniques = [];
+
+
+  videosPlaylist.forEach(
+    function(video) {
+
+      if (
+        !playlistUniqueParId[video.id]
+      ) {
+
+        playlistUniqueParId[video.id] =
+          video;
+
+        videosUniques.push(
+          video
+        );
+
+      }
+
+    }
+  );
+
+
+  Logger.log(
+    'Vidéos uniques dans Uploads : ' +
+    videosUniques.length
+  );
+
+
+  /* ------------------------------------------------------------
+     5. RÉCUPÉRATION DE VIDEOS.LIST
+     ------------------------------------------------------------ */
+
+  const videosRetournees = {};
+
+
+  for (
+    let i = 0;
+    i < videosUniques.length;
+    i += 50
+  ) {
+
+    const lot =
+      videosUniques.slice(
+        i,
+        i + 50
+      );
+
+
+    const ids =
+      lot
+        .map(function(video) {
+          return video.id;
+        })
+        .join(',');
+
+
+    const response =
+      YouTube.Videos.list(
+        'snippet,contentDetails,statistics',
+        {
+          id: ids
+        }
+      );
+
+
+    if (
+      response &&
+      response.items
+    ) {
+
+      response.items.forEach(
+        function(video) {
+
+          videosRetournees[
+            video.id
+          ] = video;
+
+        }
+      );
+
+    }
+
+  }
+
+
+  const nombreVideosRetournees =
+    Object.keys(
+      videosRetournees
+    ).length;
+
+
+  Logger.log(
+    'Vidéos retournées par Videos.list : ' +
+    nombreVideosRetournees
+  );
+
+
+  /* ------------------------------------------------------------
+     6. RECHERCHE DES VIDÉOS MANQUANTES
+     ------------------------------------------------------------ */
+
+  const videosManquantes = [];
+
+
+  videosUniques.forEach(
+    function(video) {
+
+      if (
+        !videosRetournees[video.id]
+      ) {
+
+        videosManquantes.push(
+          video
+        );
+
+      }
+
+    }
+  );
+
+
+  /* ------------------------------------------------------------
+     7. RAPPORT FINAL
+     ------------------------------------------------------------ */
+
+  Logger.log(
+    '------------------------------------------------------------'
+  );
+
+  Logger.log(
+    'RÉSULTAT DU DIAGNOSTIC'
+  );
+
+  Logger.log(
+    '------------------------------------------------------------'
+  );
+
+  Logger.log(
+    'Entrées Uploads              : ' +
+    videosPlaylist.length
+  );
+
+  Logger.log(
+    'Vidéos uniques Uploads       : ' +
+    videosUniques.length
+  );
+
+  Logger.log(
+    'Vidéos retournées Videos.list: ' +
+    nombreVideosRetournees
+  );
+
+  Logger.log(
+    'Vidéos absentes              : ' +
+    videosManquantes.length
+  );
+
+
+  Logger.log(
+    '------------------------------------------------------------'
+  );
+
+
+  if (
+    videosManquantes.length === 0
+  ) {
+
+    Logger.log(
+      'AUCUNE VIDÉO MANQUANTE.'
+    );
+
+  } else {
+
+    Logger.log(
+      'VIDÉOS PRÉSENTES DANS UPLOADS MAIS ABSENTES DE VIDEOS.LIST'
+    );
+
+
+    videosManquantes.forEach(
+      function(video, index) {
+
+        Logger.log(
+          (index + 1) +
+          '. ' +
+          video.title +
+          ' -> ' +
+          video.id +
+          ' | ' +
+          video.publishedAt
+        );
+
+      }
+    );
+
+  }
+
+
+  Logger.log(
+    '------------------------------------------------------------'
+  );
+
+  Logger.log(
+    'Vérification arithmétique : ' +
+    videosUniques.length +
+    ' - ' +
+    nombreVideosRetournees +
+    ' = ' +
+    videosManquantes.length
+  );
+
+
+  Logger.log(
+    '============================================================'
+  );
+
+  Logger.log(
+    'DIAGNOSTIC TERMINÉ — AUCUNE MODIFICATION'
+  );
+
+  Logger.log(
+    '============================================================'
+  );
+
+
+  return {
+
+    uploads:
+      videosPlaylist.length,
+
+    videosUniques:
+      videosUniques.length,
+
+    videosRetournees:
+      nombreVideosRetournees,
+
+    videosManquantes:
+      videosManquantes
+
+  };
+
+}
