@@ -859,6 +859,44 @@ function rechercherCrossref_(query) {
   }));
 }
 
+// ============================================================================
+// 22B — SOURCE CIBLÉE : NEOTROPICAL ICHTHYOLOGY
+// ============================================================================
+// Recherche ciblée dans Crossref, limitée aux articles indexés sous le titre
+// de revue Neotropical Ichthyology. Cela complète la recherche bibliographique
+// générale sans remplacer Crossref, GBIF ou Wikimedia.
+// ============================================================================
+function rechercherNeotropicalIchthyology_(query) {
+  const url =
+    'https://api.crossref.org/works?query.container-title=' +
+    encodeURIComponent('Neotropical Ichthyology') +
+    '&query.bibliographic=' +
+    encodeURIComponent(query) +
+    '&filter=type:journal-article' +
+    '&rows=10';
+
+  const json = publicJson_(url);
+
+  if (!json || !json.message || !Array.isArray(json.message.items)) {
+    return [];
+  }
+
+  return json.message.items.map(item => ({
+    type: 'crossref',
+    title: (item.title && item.title[0]) || '',
+    authors: (item.author || [])
+      .map(a => [a.given, a.family].filter(Boolean).join(' '))
+      .join(', '),
+    journal: (item['container-title'] && item['container-title'][0]) || 'Neotropical Ichthyology',
+    date: item.published && item.published['date-parts']
+      ? item.published['date-parts'][0].join('-')
+      : '',
+    doi: item.DOI || '',
+    url: item.URL || ''
+  }));
+}
+
+
 
 // ============================================================================
 // 23 — WIKIMEDIA
@@ -1439,6 +1477,14 @@ function traiterSujet_(page) {
     sources =
       sources.concat(
         rechercherCrossref_(
+          requete
+        )
+      );
+
+    // Recherche additionnelle ciblée sur Neotropical Ichthyology.
+    sources =
+      sources.concat(
+        rechercherNeotropicalIchthyology_(
           requete
         )
       );
