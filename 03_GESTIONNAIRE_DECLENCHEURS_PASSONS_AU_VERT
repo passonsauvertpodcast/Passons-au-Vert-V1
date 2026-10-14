@@ -1,0 +1,485 @@
+// ============================================================================
+// PASSONS AU VERT — AUTOMATISATIONS HORAIRES
+// ============================================================================
+// Ce fichier pilote uniquement les automatisations temporelles.
+// Il ne modifie pas le moteur YouTube, le moteur documentaire,
+// le transfert Radar -> Contenus ni les bases Notion.
+// ============================================================================
+
+const CONFIG_AUTOMATISATIONS_PVV = {
+  YOUTUBE_HANDLER: 'synchroniserNotionYouTube',
+  RADAR_HANDLER: 'lancerRadarQuotidien',
+  RADAR_HEURE: 8,
+  DOCUMENTAIRE_HANDLER: 'lancerMoteurDocumentaire',
+  DOCUMENTAIRE_MINUTE: 5,
+  PURGE_HANDLER: 'purgeRadar61Jours_',
+  PURGE_AFTER_DAYS: 61
+};
+
+
+// ============================================================================
+// 1. TEST D'EXISTENCE D'UNE FONCTION
+// ============================================================================
+//
+// IMPORTANT :
+// On n'utilise plus typeof this[nomFonction].
+//
+// Dans Google Apps Script, cette méthode peut produire un faux "MANQUANT"
+// pour certaines fonctions globales pourtant réellement disponibles.
+//
+// Le contrôle ci-dessous utilise une liste explicite des fonctions connues
+// de l'architecture Passons au Vert.
+// ============================================================================
+
+function fonctionExiste_(nomFonction) {
+
+  if (!nomFonction) {
+    return false;
+  }
+
+  try {
+
+    const fonctionsConnues = {
+
+      synchroniserNotionYouTube:
+        typeof synchroniserNotionYouTube === 'function',
+
+      synchroniserYouTubeVersNotion:
+        typeof synchroniserYouTubeVersNotion === 'function',
+
+      lancerRadarQuotidien:
+        typeof lancerRadarQuotidien === 'function',
+
+      lancerMoteurDocumentaire:
+        typeof lancerMoteurDocumentaire === 'function',
+
+      purgeRadar61Jours_:
+        typeof purgeRadar61Jours_ === 'function',
+
+      lancerTransfertRadarVersContenus:
+        typeof lancerTransfertRadarVersContenus === 'function'
+
+    };
+
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        fonctionsConnues,
+        nomFonction
+      )
+    ) {
+
+      return fonctionsConnues[nomFonction];
+
+    }
+
+
+    return false;
+
+  } catch (erreur) {
+
+    Logger.log(
+      'Erreur lors du contrôle de la fonction "' +
+      nomFonction +
+      '" : ' +
+      erreur.message
+    );
+
+    return false;
+
+  }
+}
+
+
+// ============================================================================
+// 2. AUDIT DES FONCTIONS AUTOMATISÉES
+// ============================================================================
+
+function auditerFonctionsAutomatisationsPassonsAuVert() {
+
+  Logger.log('============================================================');
+  Logger.log('AUDIT DES FONCTIONS AUTOMATISÉES');
+  Logger.log('============================================================');
+
+  const fonctions = [
+
+    {
+      nom: CONFIG_AUTOMATISATIONS_PVV.YOUTUBE_HANDLER,
+      description: 'Synchronisation YouTube -> Notion'
+    },
+
+    {
+      nom: CONFIG_AUTOMATISATIONS_PVV.RADAR_HANDLER,
+      description: 'Détection quotidienne du Radar'
+    },
+
+    {
+      nom: CONFIG_AUTOMATISATIONS_PVV.DOCUMENTAIRE_HANDLER,
+      description: 'Moteur documentaire'
+    },
+
+    {
+      nom: CONFIG_AUTOMATISATIONS_PVV.PURGE_HANDLER,
+      description: 'Purge Radar à 61 jours'
+    },
+
+    {
+      nom: 'lancerTransfertRadarVersContenus',
+      description: 'Transfert Radar -> Contenus'
+    }
+
+  ];
+
+  fonctions.forEach(function(item) {
+
+    const presente = fonctionExiste_(item.nom);
+
+    Logger.log(
+      (presente ? 'OK       ' : 'MANQUANT ') +
+      ' | ' +
+      item.description +
+      ' | ' +
+      item.nom
+    );
+
+  });
+
+  Logger.log(
+    'Purge configurée à ' +
+    CONFIG_AUTOMATISATIONS_PVV.PURGE_AFTER_DAYS +
+    ' jours.'
+  );
+
+  Logger.log('============================================================');
+}
+
+
+// ============================================================================
+// 3. AUDIT DES DÉCLENCHEURS
+// ============================================================================
+
+function auditerDeclencheursPassonsAuVert() {
+
+  Logger.log('============================================================');
+  Logger.log('AUDIT DES DÉCLENCHEURS PASSONS AU VERT');
+  Logger.log('============================================================');
+
+  const triggers = ScriptApp.getProjectTriggers();
+
+  if (!triggers.length) {
+
+    Logger.log('AUCUN DÉCLENCHEUR INSTALLÉ.');
+    Logger.log('============================================================');
+
+    return;
+  }
+
+  triggers.forEach(function(trigger, index) {
+
+    let handler = 'INCONNU';
+    let type = 'INCONNU';
+
+    try {
+      handler = trigger.getHandlerFunction();
+    } catch (e) {}
+
+    try {
+      type = String(trigger.getEventType());
+    } catch (e) {}
+
+    Logger.log(
+      (index + 1) +
+      ' | Fonction : ' +
+      handler +
+      ' | Type : ' +
+      type
+    );
+
+  });
+
+  Logger.log('============================================================');
+}
+
+
+// ============================================================================
+// 4. SUPPRESSION CIBLÉE DES DÉCLENCHEURS
+// ============================================================================
+//
+// IMPORTANT :
+// Cette fonction ne supprime QUE les déclencheurs correspondant à la fonction
+// passée en paramètre.
+//
+// Le déclencheur YouTube n'est donc pas touché lorsqu'on gère Radar ou
+// le moteur documentaire.
+// ============================================================================
+
+function supprimerDeclencheursFonction_(nomFonction) {
+
+  if (!nomFonction) {
+    return;
+  }
+
+  const triggers = ScriptApp.getProjectTriggers();
+
+  triggers.forEach(function(trigger) {
+
+    let handler = '';
+
+    try {
+      handler = trigger.getHandlerFunction();
+    } catch (e) {
+      return;
+    }
+
+    if (handler === nomFonction) {
+
+      ScriptApp.deleteTrigger(trigger);
+
+      Logger.log(
+        'Déclencheur supprimé : ' +
+        nomFonction
+      );
+
+    }
+
+  });
+}
+
+
+// ============================================================================
+// 5. INSTALLATION DU RADAR QUOTIDIEN
+// ============================================================================
+//
+// Le moteur Radar n'est PAS inventé ici.
+//
+// Si la fonction lancerRadarQuotidien n'existe pas encore dans le projet,
+// aucun déclencheur Radar cassé n'est créé.
+// ============================================================================
+
+function installerDeclencheurRadarQuotidien_() {
+
+  const handler =
+    CONFIG_AUTOMATISATIONS_PVV.RADAR_HANDLER;
+
+  if (!fonctionExiste_(handler)) {
+
+    Logger.log(
+      'RADAR : déclencheur NON installé.'
+    );
+
+    Logger.log(
+      'Fonction manquante : ' +
+      handler
+    );
+
+    Logger.log(
+      'Le moteur de détection Radar quotidien doit encore être retrouvé ou créé.'
+    );
+
+    return false;
+  }
+
+  supprimerDeclencheursFonction_(handler);
+
+  ScriptApp.newTrigger(handler)
+    .timeBased()
+    .everyDays(1)
+    .atHour(
+      CONFIG_AUTOMATISATIONS_PVV.RADAR_HEURE
+    )
+    .create();
+
+  Logger.log(
+    'RADAR : déclencheur quotidien installé à ' +
+    CONFIG_AUTOMATISATIONS_PVV.RADAR_HEURE +
+    ' h.'
+  );
+
+  return true;
+}
+
+
+// ============================================================================
+// 6. INSTALLATION DU MOTEUR DOCUMENTAIRE HORAIRE
+// ============================================================================
+
+function installerDeclencheurDocumentaireHoraire_() {
+
+  const handler =
+    CONFIG_AUTOMATISATIONS_PVV.DOCUMENTAIRE_HANDLER;
+
+  if (!fonctionExiste_(handler)) {
+
+    throw new Error(
+      'La fonction ' +
+      handler +
+      ' est introuvable.'
+    );
+  }
+
+  supprimerDeclencheursFonction_(handler);
+
+  ScriptApp.newTrigger(handler)
+    .timeBased()
+    .everyHours(1)
+    .nearMinute(
+      CONFIG_AUTOMATISATIONS_PVV.DOCUMENTAIRE_MINUTE
+    )
+    .create();
+
+  Logger.log(
+    'DOCUMENTAIRE : déclencheur horaire installé vers xx:' +
+    String(
+      CONFIG_AUTOMATISATIONS_PVV.DOCUMENTAIRE_MINUTE
+    ).padStart(2, '0') +
+    '.'
+  );
+
+  return true;
+}
+
+
+// ============================================================================
+// 7. INSTALLATION DES AUTOMATISATIONS
+// ============================================================================
+//
+// IMPORTANT :
+// Le déclencheur YouTube existant est laissé totalement intact.
+// ============================================================================
+
+function installerAutomatisationsPassonsAuVert() {
+
+  Logger.log('============================================================');
+  Logger.log('INSTALLATION DES AUTOMATISATIONS');
+  Logger.log('============================================================');
+
+
+  // --------------------------------------------------------------------------
+  // YOUTUBE
+  // --------------------------------------------------------------------------
+
+  if (
+    fonctionExiste_(
+      CONFIG_AUTOMATISATIONS_PVV.YOUTUBE_HANDLER
+    )
+  ) {
+
+    Logger.log(
+      'YOUTUBE : fonction ' +
+      CONFIG_AUTOMATISATIONS_PVV.YOUTUBE_HANDLER +
+      ' présente.'
+    );
+
+    Logger.log(
+      'YOUTUBE : déclencheur existant laissé totalement intact.'
+    );
+
+  } else {
+
+    Logger.log(
+      'ATTENTION : fonction YouTube introuvable.'
+    );
+
+  }
+
+
+  // --------------------------------------------------------------------------
+  // RADAR
+  // --------------------------------------------------------------------------
+
+  installerDeclencheurRadarQuotidien_();
+
+
+  // --------------------------------------------------------------------------
+  // DOCUMENTAIRE
+  // --------------------------------------------------------------------------
+
+  installerDeclencheurDocumentaireHoraire_();
+
+
+  // --------------------------------------------------------------------------
+  // FIN
+  // --------------------------------------------------------------------------
+
+  Logger.log('============================================================');
+  Logger.log('INSTALLATION TERMINÉE');
+  Logger.log('============================================================');
+
+  auditerDeclencheursPassonsAuVert();
+}
+
+
+// ============================================================================
+// 8. AUDIT GLOBAL DES AUTOMATISATIONS TEMPORELLES
+// ============================================================================
+//
+// Cette fonction est en lecture seule.
+// Elle ne crée et ne supprime aucun déclencheur.
+// ============================================================================
+
+function auditerAutomatisationsPassonsAuVert() {
+
+  Logger.log('');
+  Logger.log('============================================================');
+  Logger.log('AUDIT AUTOMATISATIONS PASSONS AU VERT');
+  Logger.log('============================================================');
+
+
+  Logger.log('');
+  Logger.log('--- FONCTIONS ---');
+
+  auditerFonctionsAutomatisationsPassonsAuVert();
+
+
+  Logger.log('');
+  Logger.log('--- DÉCLENCHEURS ---');
+
+  auditerDeclencheursPassonsAuVert();
+
+
+  Logger.log('');
+  Logger.log('--- AUTOMATISATIONS ATTENDUES ---');
+
+  Logger.log(
+    'YouTube : ' +
+    CONFIG_AUTOMATISATIONS_PVV.YOUTUBE_HANDLER +
+    ' (existant, à laisser intact)'
+  );
+
+  Logger.log(
+    'Radar : ' +
+    CONFIG_AUTOMATISATIONS_PVV.RADAR_HANDLER +
+    ' (quotidien à ' +
+    CONFIG_AUTOMATISATIONS_PVV.RADAR_HEURE +
+    ' h)'
+  );
+
+  Logger.log(
+    'Documentaire : ' +
+    CONFIG_AUTOMATISATIONS_PVV.DOCUMENTAIRE_HANDLER +
+    ' (toutes les heures vers xx:' +
+    String(
+      CONFIG_AUTOMATISATIONS_PVV.DOCUMENTAIRE_MINUTE
+    ).padStart(2, '0') +
+    ')'
+  );
+
+  Logger.log(
+    'Purge : ' +
+    CONFIG_AUTOMATISATIONS_PVV.PURGE_HANDLER +
+    ' (' +
+    CONFIG_AUTOMATISATIONS_PVV.PURGE_AFTER_DAYS +
+    ' jours)'
+  );
+
+
+  Logger.log('');
+  Logger.log('============================================================');
+  Logger.log("FIN DE L'AUDIT");
+  Logger.log('============================================================');
+}
+
+
+// ============================================================================
+// FIN DU FICHIER
+// ============================================================================
