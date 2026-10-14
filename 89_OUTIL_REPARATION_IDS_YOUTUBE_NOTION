@@ -1,0 +1,690 @@
+/************************************************************
+ * PASSONS AU VERT
+ * RÉPARATION CONTRÔLÉE DES IDs YOUTUBE DANS NOTION
+ *
+ * IMPORTANT :
+ * - Le token Notion est défini dans "Notion Token.gs"
+ * - Aucun rapprochement par titre
+ * - Aucune nouvelle page créée
+ * - Aucune fiche sans ID n'est modifiée
+ * - Les valeurs impossibles à prouver sont conservées
+ * - Seule "Vidéos YouTube" peut être modifiée
+ ************************************************************/
+
+
+/* ==========================================================
+   CONFIGURATION
+   ========================================================== */
+
+var NOTION_DATABASE_ID =
+  '698fdf4d-7160-40c4-ba06-9ce158c55ad4';
+
+
+/* ==========================================================
+   TEST
+   ========================================================== */
+
+function testReparerIDsYouTube() {
+
+  Logger.log('==================================================');
+  Logger.log('TEST — RÉPARATION DES IDs YOUTUBE');
+  Logger.log('Début : ' + new Date().toISOString());
+  Logger.log('==================================================');
+
+  try {
+
+    reparerIDsYouTube();
+
+    Logger.log('==================================================');
+    Logger.log('TEST TERMINÉ SANS ERREUR');
+    Logger.log('Fin : ' + new Date().toISOString());
+    Logger.log('==================================================');
+
+  } catch (erreur) {
+
+    Logger.log('==================================================');
+    Logger.log('ERREUR PENDANT LE TEST');
+    Logger.log(erreur);
+    Logger.log('==================================================');
+
+    throw erreur;
+  }
+}
+
+
+/* ==========================================================
+   RÉPARATION DES IDs
+   ========================================================== */
+
+function reparerIDsYouTube() {
+
+  Logger.log('Début de la réparation contrôlée.');
+
+
+  /* --------------------------------------------------------
+     Vérification du token
+     -------------------------------------------------------- */
+
+  if (
+    typeof NOTION_TOKEN === 'undefined' ||
+    !NOTION_TOKEN ||
+    String(NOTION_TOKEN).trim() === ''
+  ) {
+
+    throw new Error(
+      'NOTION_TOKEN est introuvable. ' +
+      'Vérifie le fichier "Notion Token.gs".'
+    );
+  }
+
+
+  /* --------------------------------------------------------
+     1. RÉCUPÉRATION DES VRAIES VIDÉOS YOUTUBE
+     -------------------------------------------------------- */
+
+  var videosYouTube =
+    recupererToutesLesVideosYouTubeAvecUploads();
+
+  Logger.log(
+    'Vidéos YouTube réellement trouvées : ' +
+    videosYouTube.length
+  );
+
+
+  /* --------------------------------------------------------
+     2. INDEX DES IDs YOUTUBE
+     -------------------------------------------------------- */
+
+  var idsYouTube = {};
+
+  videosYouTube.forEach(function(video) {
+
+    idsYouTube[video.id] = video;
+
+  });
+
+
+  /* --------------------------------------------------------
+     3. RÉCUPÉRATION DES PAGES NOTION
+     -------------------------------------------------------- */
+
+  var pages =
+    recupererToutesLesPagesNotion();
+
+  Logger.log(
+    'Pages Notion analysées : ' +
+    pages.length
+  );
+
+
+  /* --------------------------------------------------------
+     4. COMPTEURS
+     -------------------------------------------------------- */
+
+  var reparations = 0;
+  var nonReparables = 0;
+  var dejaCorrectes = 0;
+  var sansVideo = 0;
+
+
+  /* --------------------------------------------------------
+     5. ANALYSE DES PAGES
+     -------------------------------------------------------- */
+
+  pages.forEach(function(page) {
+
+    var titre =
+      lireTitrePage(page);
+
+    var valeur =
+      lireTextePropriete(
+        page,
+        'Vidéos YouTube'
+      );
+
+
+    /* ------------------------------------------------------
+       AUCUNE VALEUR :
+       NE PAS MODIFIER
+       ------------------------------------------------------ */
+
+    if (!valeur || valeur.trim() === '') {
+
+      sansVideo++;
+
+      return;
+    }
+
+
+    /* ------------------------------------------------------
+       VÉRIFICATION D'UNE VALEUR DÉJÀ CORRECTE
+       ------------------------------------------------------ */
+
+    var tokens =
+      valeur
+        .split(/\s+/)
+        .map(function(x) {
+          return x.trim();
+        })
+        .filter(function(x) {
+          return x !== '';
+        });
+
+
+    var tousValides =
+      tokens.length > 0 &&
+      tokens.every(function(token) {
+
+        return (
+          /^[A-Za-z0-9_-]{11}$/.test(token) &&
+          idsYouTube[token]
+        );
+
+      });
+
+
+    if (tousValides) {
+
+      dejaCorrectes++;
+
+      return;
+    }
+
+
+    /* ------------------------------------------------------
+       RECHERCHE UNIQUEMENT D'IDs RÉELS
+       DE LA CHAÎNE YOUTUBE
+       ------------------------------------------------------ */
+
+    var idsTrouves = [];
+
+
+    Object.keys(idsYouTube).forEach(function(id) {
+
+      if (valeur.indexOf(id) !== -1) {
+
+        if (idsTrouves.indexOf(id) === -1) {
+
+          idsTrouves.push(id);
+
+        }
+
+      }
+
+    });
+
+
+    /* ------------------------------------------------------
+       AUCUN ID PROUVABLE :
+       NE PAS MODIFIER
+       ------------------------------------------------------ */
+
+    if (idsTrouves.length === 0) {
+
+      nonReparables++;
+
+      Logger.log(
+        'NON RÉPARABLE : ' +
+        titre +
+        ' -> "' +
+        valeur +
+        '"'
+      );
+
+      return;
+    }
+
+
+    /* ------------------------------------------------------
+       RECONSTRUCTION PROPRE
+       ------------------------------------------------------ */
+
+    var richText =
+      idsTrouves.map(function(id) {
+
+        return {
+          type: 'text',
+          text: {
+            content: id
+          }
+        };
+
+      });
+
+
+    var properties = {};
+
+    properties['Vidéos YouTube'] = {
+      rich_text: richText
+    };
+
+
+    /* ------------------------------------------------------
+       UNIQUE MODIFICATION AUTORISÉE
+       ------------------------------------------------------ */
+
+    notionUpdatePage(
+      page.id,
+      properties
+    );
+
+
+    reparations++;
+
+
+    Logger.log(
+      'RÉPARATION OK : ' +
+      titre +
+      ' -> ' +
+      idsTrouves.join(' ')
+    );
+
+  });
+
+
+  /* --------------------------------------------------------
+     6. BILAN
+     -------------------------------------------------------- */
+
+  Logger.log('');
+  Logger.log('==================================================');
+  Logger.log('BILAN DE LA RÉPARATION');
+  Logger.log('==================================================');
+
+  Logger.log(
+    'Pages analysées : ' +
+    pages.length
+  );
+
+  Logger.log(
+    'Réparations effectuées : ' +
+    reparations
+  );
+
+  Logger.log(
+    'Déjà correctes : ' +
+    dejaCorrectes
+  );
+
+  Logger.log(
+    'Sans ID YouTube : ' +
+    sansVideo
+  );
+
+  Logger.log(
+    'Non réparables : ' +
+    nonReparables
+  );
+
+  Logger.log('==================================================');
+  Logger.log('FIN DE LA RÉPARATION');
+  Logger.log('==================================================');
+}
+
+
+/* ==========================================================
+   YOUTUBE
+   ========================================================== */
+
+function recupererToutesLesVideosYouTubeAvecUploads() {
+
+  var channelResponse =
+    YouTube.Channels.list(
+      'contentDetails,snippet',
+      {
+        mine: true
+      }
+    );
+
+
+  if (
+    !channelResponse ||
+    !channelResponse.items ||
+    channelResponse.items.length === 0
+  ) {
+
+    throw new Error(
+      'Impossible de récupérer la chaîne YouTube connectée.'
+    );
+  }
+
+
+  var uploadsPlaylistId =
+    channelResponse.items[0]
+      .contentDetails
+      .relatedPlaylists
+      .uploads;
+
+
+  if (!uploadsPlaylistId) {
+
+    throw new Error(
+      'Impossible de récupérer la playlist des vidéos.'
+    );
+  }
+
+
+  var videos = [];
+  var pageToken = '';
+
+
+  do {
+
+    var response =
+      YouTube.PlaylistItems.list(
+        'snippet,contentDetails',
+        {
+          playlistId: uploadsPlaylistId,
+          maxResults: 50,
+          pageToken: pageToken
+        }
+      );
+
+
+    if (response.items) {
+
+      response.items.forEach(function(item) {
+
+        var videoId =
+          item.contentDetails &&
+          item.contentDetails.videoId;
+
+        var title =
+          item.snippet &&
+          item.snippet.title;
+
+        var publishedAt =
+          item.snippet &&
+          item.snippet.publishedAt;
+
+
+        if (videoId) {
+
+          videos.push({
+            id: videoId,
+            titre: title || '',
+            publishedAt: publishedAt || ''
+          });
+
+        }
+
+      });
+
+    }
+
+
+    pageToken =
+      response.nextPageToken || '';
+
+  } while (pageToken);
+
+
+  return videos;
+}
+
+
+/* ==========================================================
+   NOTION — RÉCUPÉRATION DES PAGES
+   ========================================================== */
+
+function recupererToutesLesPagesNotion() {
+
+  var pages = [];
+  var startCursor = null;
+
+
+  do {
+
+    /*
+     * IMPORTANT :
+     * On utilise ici l'endpoint DATABASES.
+     * L'endpoint DATA_SOURCES provoquait :
+     * invalid_request_url
+     */
+
+    var url =
+      'https://api.notion.com/v1/databases/' +
+      NOTION_DATABASE_ID +
+      '/query';
+
+
+    var payload = {};
+
+
+    if (startCursor) {
+
+      payload.start_cursor =
+        startCursor;
+
+    }
+
+
+    var options = {
+
+      method: 'post',
+
+      headers: {
+
+        'Authorization':
+          'Bearer ' + NOTION_TOKEN,
+
+        'Notion-Version':
+          '2022-06-28',
+
+        'Content-Type':
+          'application/json'
+
+      },
+
+      payload:
+        JSON.stringify(payload),
+
+      muteHttpExceptions: true
+
+    };
+
+
+    var response =
+      UrlFetchApp.fetch(
+        url,
+        options
+      );
+
+
+    var code =
+      response.getResponseCode();
+
+    var texte =
+      response.getContentText();
+
+
+    if (code < 200 || code >= 300) {
+
+      throw new Error(
+        'Erreur API Notion ' +
+        code +
+        ' : ' +
+        texte
+      );
+
+    }
+
+
+    var data =
+      JSON.parse(texte);
+
+
+    if (data.results) {
+
+      pages =
+        pages.concat(data.results);
+
+    }
+
+
+    if (data.has_more) {
+
+      startCursor =
+        data.next_cursor;
+
+    } else {
+
+      startCursor = null;
+
+    }
+
+  } while (startCursor);
+
+
+  return pages;
+}
+
+
+/* ==========================================================
+   NOTION — TITRE
+   ========================================================== */
+
+function lireTitrePage(page) {
+
+  if (
+    !page ||
+    !page.properties
+  ) {
+
+    return '';
+
+  }
+
+
+  var propriete =
+    page.properties.Nom;
+
+
+  if (
+    !propriete ||
+    !propriete.title
+  ) {
+
+    return '';
+
+  }
+
+
+  return propriete.title
+    .map(function(item) {
+
+      return item.plain_text || '';
+
+    })
+    .join('');
+}
+
+
+/* ==========================================================
+   NOTION — PROPRIÉTÉ TEXTE
+   ========================================================== */
+
+function lireTextePropriete(
+  page,
+  nomPropriete
+) {
+
+  if (
+    !page ||
+    !page.properties
+  ) {
+
+    return '';
+
+  }
+
+
+  var propriete =
+    page.properties[nomPropriete];
+
+
+  if (
+    !propriete ||
+    !propriete.rich_text
+  ) {
+
+    return '';
+
+  }
+
+
+  return propriete.rich_text
+    .map(function(item) {
+
+      return item.plain_text || '';
+
+    })
+    .join('');
+}
+
+
+/* ==========================================================
+   NOTION — MISE À JOUR
+   ========================================================== */
+
+function notionUpdatePage(
+  pageId,
+  properties
+) {
+
+  var url =
+    'https://api.notion.com/v1/pages/' +
+    pageId;
+
+
+  var options = {
+
+    method: 'patch',
+
+    headers: {
+
+      'Authorization':
+        'Bearer ' + NOTION_TOKEN,
+
+      'Notion-Version':
+        '2022-06-28',
+
+      'Content-Type':
+        'application/json'
+
+    },
+
+    payload:
+      JSON.stringify({
+        properties: properties
+      }),
+
+    muteHttpExceptions: true
+
+  };
+
+
+  var response =
+    UrlFetchApp.fetch(
+      url,
+      options
+    );
+
+
+  var code =
+    response.getResponseCode();
+
+  var texte =
+    response.getContentText();
+
+
+  if (code < 200 || code >= 300) {
+
+    throw new Error(
+      'Erreur lors de la mise à jour Notion ' +
+      code +
+      ' : ' +
+      texte
+    );
+ }
+}
