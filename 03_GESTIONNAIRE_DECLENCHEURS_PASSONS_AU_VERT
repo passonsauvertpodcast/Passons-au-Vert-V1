@@ -348,64 +348,51 @@ function installerDeclencheurDocumentaireHoraire_() {
 // ============================================================================
 
 function installerAutomatisationsPassonsAuVert() {
-
   Logger.log('============================================================');
-  Logger.log('INSTALLATION DES AUTOMATISATIONS');
+  Logger.log('INSTALLATION DES AUTOMATISATIONS — VERSION ROBUSTE');
   Logger.log('============================================================');
 
-
-  // --------------------------------------------------------------------------
-  // YOUTUBE
-  // --------------------------------------------------------------------------
-
-  if (
-    fonctionExiste_(
-      CONFIG_AUTOMATISATIONS_PVV.YOUTUBE_HANDLER
-    )
-  ) {
-
+  // YouTube : lecture seule ici, ne jamais supprimer/recréer son déclencheur.
+  try {
+    const youtubeHandler = CONFIG_AUTOMATISATIONS_PVV.YOUTUBE_HANDLER;
     Logger.log(
-      'YOUTUBE : fonction ' +
-      CONFIG_AUTOMATISATIONS_PVV.YOUTUBE_HANDLER +
-      ' présente.'
+      (fonctionExiste_(youtubeHandler) ? 'YOUTUBE OK : ' : 'YOUTUBE ABSENT : ') +
+      youtubeHandler +
+      ' — déclencheur existant laissé intact.'
     );
-
-    Logger.log(
-      'YOUTUBE : déclencheur existant laissé totalement intact.'
-    );
-
-  } else {
-
-    Logger.log(
-      'ATTENTION : fonction YouTube introuvable.'
-    );
-
+  } catch (e) {
+    Logger.log('YOUTUBE — diagnostic en erreur : ' + e.message);
   }
 
+  // Chaque automatisation est isolée : une erreur ne doit pas empêcher
+  // les autres diagnostics ou installations de s'exécuter.
+  try {
+    const radarInstalle = installerDeclencheurRadarQuotidien_();
+    Logger.log('RADAR — résultat installation : ' + (radarInstalle ? 'OK' : 'NON INSTALLÉ'));
+  } catch (e) {
+    Logger.log('RADAR — ERREUR INSTALLATION : ' + e.message);
+  }
 
-  // --------------------------------------------------------------------------
-  // RADAR
-  // --------------------------------------------------------------------------
+  try {
+    const documentaireInstalle = installerDeclencheurDocumentaireHoraire_();
+    Logger.log('DOCUMENTAIRE — résultat installation : ' + (documentaireInstalle ? 'OK' : 'NON INSTALLÉ'));
+  } catch (e) {
+    Logger.log('DOCUMENTAIRE — ERREUR INSTALLATION : ' + e.message);
+  }
 
-  installerDeclencheurRadarQuotidien_();
+  Logger.log('--- AUDIT FINAL DES DÉCLENCHEURS ---');
+  try {
+    auditerFonctionsAutomatisationsPassonsAuVert();
+  } catch (e) {
+    Logger.log('AUDIT FONCTIONS — ERREUR : ' + e.message);
+  }
+  try {
+    auditerDeclencheursPassonsAuVert();
+  } catch (e) {
+    Logger.log('AUDIT DÉCLENCHEURS — ERREUR : ' + e.message);
+  }
 
-
-  // --------------------------------------------------------------------------
-  // DOCUMENTAIRE
-  // --------------------------------------------------------------------------
-
-  installerDeclencheurDocumentaireHoraire_();
-
-
-  // --------------------------------------------------------------------------
-  // FIN
-  // --------------------------------------------------------------------------
-
-  Logger.log('============================================================');
-  Logger.log('INSTALLATION TERMINÉE');
-  Logger.log('============================================================');
-
-  auditerDeclencheursPassonsAuVert();
+  Logger.log('INSTALLATION TERMINÉE — lire les lignes ERREUR ci-dessus avant toute autre action.');
 }
 
 
