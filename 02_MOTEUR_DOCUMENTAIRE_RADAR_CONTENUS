@@ -3301,5 +3301,20 @@ function lancerMoteurGlobalPassonsAuVert() {
 
 
 // ============================================================================
+// ============================================================================
+// 57 — POINT D'ENTRÉE QUOTIDIEN COMPATIBLE AVEC LE GESTIONNAIRE V1
+// ============================================================================
+// Le dépôt V1 ne contient pas de moteur autonome de collecte Radar scientifique.
+// Ce point d'entrée remet en service le traitement des fiches déjà présentes :
+// le moteur documentaire est planifié séparément, et ce passage transfère les
+// fiches éligibles vers Contenus. Il ne prétend pas remplacer une collecte absente.
+// ============================================================================
+function lancerRadarQuotidien() {
+  Logger.log('RADAR QUOTIDIEN — traitement des fiches existantes');
+  Logger.log('Collecte autonome : aucun moteur de collecte Radar trouvé dans le dépôt V1.');
+  lancerTransfertRadarVersContenus();
+}
+
+
 // FIN DU SCRIPT
 // ============================================================================
